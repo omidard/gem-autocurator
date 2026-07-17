@@ -30,7 +30,7 @@ def trim_rates(lst):
         out.append({"ex": ex, "met": x.get("bigg_metabolite"), "r": round(float(r), 4), "u": x.get("units") or ""})
     return out
 
-records, species, referenced = [], {}, set()
+records, species, referenced, tax2sp = [], {}, set(), {}
 for r in gr:
     mu = r.get("growth_rate_per_h")
     up = trim_rates(r.get("uptake_rates"))
@@ -41,6 +41,10 @@ for r in gr:
     mid = med.get("media_id")
     if mid:
         referenced.add(mid)
+    tax = r.get("ncbi_tax_id")
+    sp_key = r.get("gtdb_species") or r.get("species") or r.get("organism")
+    if tax and sp_key and str(tax) not in tax2sp:
+        tax2sp[str(tax)] = sp_key
     cond = r.get("conditions") or {}
     prov = r.get("provenance") or {}
     sp = r.get("gtdb_species") or r.get("species") or r.get("organism") or "unknown"
@@ -58,7 +62,7 @@ for r in gr:
     species[sp] = species.get(sp, 0) + 1
 
 species_list = sorted(species.keys())
-json.dump({"species": species_list, "records": records}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
+json.dump({"species": species_list, "records": records, "tax2sp": tax2sp}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
 
 # media exchange compositions for referenced media
 media_ex = {}

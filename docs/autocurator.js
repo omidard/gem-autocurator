@@ -592,39 +592,86 @@ function matchSpecies(query, limit) {
     return { sp, score, n: (GDB.bySpecies[sp] || []).length };
   }).filter(x => x.score > 0).sort((a, b) => b.score - a.score || b.n - a.n).slice(0, limit || 8);
 }
+/* ---- organism auto-detection (strain name / GCF-GCA accession / BV-BRC id / taxon) ---- */
+async function ncbiJson(url) { try { const r = await fetch(url); if (!r.ok) return null; return await r.json(); } catch (e) { return null; } }
+async function ncbiOrgFromAccession(acc) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/' + encodeURIComponent(acc) + '/dataset_report'); const rep = d && d.reports && d.reports[0]; const o = rep && rep.organism; return o ? { name: o.organism_name, taxid: o.tax_id } : null; }
+async function ncbiOrgFromTaxon(tid) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/taxonomy/taxon/' + encodeURIComponent(tid)); const n = d && d.taxonomy_nodes && d.taxonomy_nodes[0] && d.taxonomy_nodes[0].taxonomy; return n ? { name: n.organism_name, taxid: n.tax_id } : null; }
+async function resolveOrganism(text) {
+  if (!text) return null; const t = String(text).trim();
+  let m = t.match(/\bGC[AF]_?\d{6,}(?:\.\d+)?/i);
+  if (m) { let acc = m[0].toUpperCase().replace(/^(GC[AF])(\d)/, '$1_$2'); if (!/\.\d+$/.test(acc)) acc += '.1'; const o = await ncbiOrgFromAccession(acc); if (o) return { name: o.name, taxid: o.taxid, via: 'assembly ' + acc + ' · NCBI', conf: true }; }
+  m = t.match(/\b\d{9}(?:\.\d+)?\b/);
+  if (m) { const ver = /\.\d+$/.test(m[0]) ? m[0] : m[0] + '.1'; for (const pre of ['GCF_', 'GCA_']) { const o = await ncbiOrgFromAccession(pre + ver); if (o) return { name: o.name, taxid: o.taxid, via: 'assembly ' + pre + ver + ' · NCBI', conf: true }; } }
+  m = t.match(/\b(\d{3,7})\.\d{1,3}\b/);
+  if (m) { const tid = m[1]; if (GDB.tax2sp && GDB.tax2sp[tid]) return { name: GDB.tax2sp[tid], taxid: tid, via: 'BV-BRC id ' + m[0] + ' · taxon ' + tid, conf: true }; const o = await ncbiOrgFromTaxon(tid); if (o) return { name: o.name, taxid: tid, via: 'BV-BRC id ' + m[0] + ' · NCBI taxon', conf: true }; }
+  m = t.match(/^\d{3,7}$/);
+  if (m) { const tid = m[0]; if (GDB.tax2sp && GDB.tax2sp[tid]) return { name: GDB.tax2sp[tid], taxid: tid, via: 'taxon ' + tid, conf: true }; const o = await ncbiOrgFromTaxon(tid); if (o) return { name: o.name, taxid: tid, via: 'NCBI taxon ' + tid, conf: true }; }
+  const norm = t.replace(/[_\-]+/g, ' ').replace(/\.(xml|json|mat|sbml)$/i, '');
+  if (/[a-z]{3,}/i.test(norm)) { const best = matchSpecies(norm, 1)[0]; if (best) return { name: best.sp, via: 'model name', conf: best.score >= 60 }; }
+  return null;
+}
+async function detectOrganism() {
+  for (const c of [MODEL.name, MODEL.id]) { const r = await resolveOrganism(c); if (r) return r; }
+  return null;
+}
+function speciesNorm(name) {   // strain/organism name -> "Genus species"
+  let s = String(name || '').replace(/[\[\]]/g, '').replace(/^Candidatus\s+/i, '').trim();
+  const parts = s.split(/\s+/);
+  if (parts.length >= 2 && /^[A-Za-z]/.test(parts[0])) return parts[0] + ' ' + parts[1].replace(/[^A-Za-z0-9.\-]/g, '');
+  return s;
+}
+function speciesToGdb(name) {   // resolved organism name -> best GrowthDB species (with data) or null
+  if (!name) return null;
+  if (GDB.bySpecies[name]) return name;
+  const norm = speciesNorm(name);
+  if (GDB.bySpecies[norm]) return norm;
+  const best = matchSpecies(norm, 1)[0]; return best && best.score >= 55 ? best.sp : null;
+}
+
 function renderValidate() {
   const s = $('stage-validate'); s.innerHTML = '';
-  s.appendChild(el('div', 'ac-sh', `<h2>Lab validation</h2><p>Match your organism against <b>GrowthDB</b> (measured growth / uptake / secretion, literature-sourced), bind the reported medium from the <b>Media DB</b>, and simulate — the model's predicted growth rate and secretion are compared against the experiment with the bundled GLPK solver.</p>`));
-  const box = el('div', 'ac-card'); box.innerHTML = `<h3>Find your organism</h3><div class="sub">Type a species or strain name — matching is typo-tolerant and shows the closest hits in GrowthDB.</div>
-    <input id="val-q" type="text" placeholder="e.g. Escherichia coli, B. subtilis, Ruminococcus…" style="width:100%;margin-top:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);font-size:14px">
-    <div id="val-hits" style="margin-top:10px"></div>`;
+  s.appendChild(el('div', 'ac-sh', `<h2>Lab validation</h2><p>The organism is auto-detected from the model — a strain name, a GCF/GCA assembly accession (with or without prefix), or a BV-BRC id. Its measured growth from <b>GrowthDB</b> and medium from the <b>Media DB</b> are loaded into an editable condition; you tune the exchange fluxes and simulate, and the model's predicted growth and secretion are compared to the experiment.</p>`));
+  const banner = el('div', 'ac-card'); banner.id = 'val-banner'; banner.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Loading GrowthDB & Media DB, detecting organism…</span></div>`;
+  s.appendChild(banner);
+  const box = el('div', 'ac-card'); box.innerHTML = `<h3>Organism</h3><div class="sub">Auto-detected from the model id/name. Override here — matching is typo-tolerant.</div>
+    <input id="val-q" type="text" placeholder="e.g. Escherichia coli, B. subtilis, GCF_000005845.2, 511145.12…" style="width:100%;margin-top:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);font-size:14px">
+    <div id="val-hits" style="margin-top:10px"></div>
+    <div style="font-size:11px;color:var(--ink-3);margin-top:8px">Accession / id resolution sends only the identifier string to the NCBI Datasets API — your model never leaves the page.</div>`;
   s.appendChild(box);
   const results = el('div', ''); results.id = 'val-results'; s.appendChild(results);
-  const loading = el('div', 'ac-load'); loading.style.cssText = 'display:flex;gap:10px;align-items:center;color:var(--ink-2);font-size:13px'; loading.innerHTML = '<div class="ac-spin"></div> Loading GrowthDB & Media DB…';
-  s.appendChild(loading);
-  loadValidation().then(() => {
-    loading.remove();
-    box.querySelector('.sub').innerHTML += ` <b>${fmt(GDB.records.length)}</b> records across <b>${fmt(GDB.species.length)}</b> species loaded.`;
+  loadValidation().then(async () => {
+    box.querySelector('.sub').innerHTML += ` <b>${fmt(GDB.records.length)}</b> records / <b>${fmt(GDB.species.length)}</b> species loaded.`;
     const q = $('val-q'), hits = $('val-hits');
     const showHits = () => {
       const m = matchSpecies(q.value, 8); hits.innerHTML = '';
       if (!q.value.trim()) return;
-      if (!m.length) { hits.innerHTML = `<div class="ac-empty" style="padding:10px">No GrowthDB species matches “${esc(q.value)}”. Try a genus, or a different spelling.</div>`; return; }
+      if (!m.length) { hits.innerHTML = `<div class="ac-empty" style="padding:10px">No GrowthDB species matches “${esc(q.value)}”. <button class="ac-btn" id="val-manual2" style="margin-left:8px">Enter my own data →</button></div>`; const mb = $('val-manual2'); if (mb) mb.onclick = () => showNoData(q.value.trim()); return; }
       m.forEach(h => { const b = el('button', 'ac-chip'); b.style.cssText = 'margin:3px 6px 3px 0;padding:6px 11px;border:1px solid var(--line);border-radius:16px;background:var(--surface-2);color:var(--ink);cursor:pointer;font-size:13px';
         b.innerHTML = `<i>${esc(h.sp)}</i> <span style="color:var(--primary-2);font-weight:600">${h.n}</span>`;
         b.onclick = () => { _valState.sp = h.sp; showRecords(h.sp); }; hits.appendChild(b); });
     };
-    q.oninput = showHits; q.value = _valState.query || ''; if (q.value) showHits();
-    if (_valState.sp) showRecords(_valState.sp);
-    q.addEventListener('input', () => { _valState.query = q.value; });
+    q.oninput = () => { _valState.query = q.value; showHits(); };
+    // auto-detect
+    const det = await detectOrganism();
+    const bn = $('val-banner');
+    if (!det) { bn.innerHTML = `<h3>Organism not auto-detected</h3><div class="sub">Couldn't read a strain name, assembly accession or BV-BRC id from <code>${esc(MODEL.id || '')}</code>${MODEL.name && MODEL.name !== MODEL.id ? ' / <code>' + esc(MODEL.name) + '</code>' : ''}. Type your strain in the box below.</div>`; }
+    else {
+      const gsp = det.conf ? speciesToGdb(det.name) : null;
+      if (det.conf && gsp) { bn.innerHTML = `<h3>✓ <i>${esc(gsp)}</i></h3><div class="sub">Detected via ${esc(det.via)}. GrowthDB has <b>${fmt((GDB.bySpecies[gsp] || []).length)}</b> measured records — loading conditions below.</div>`; _valState.sp = gsp; q.value = gsp; showRecords(gsp); }
+      else if (det.conf) { bn.innerHTML = `<h3>Detected <i>${esc(det.name)}</i></h3><div class="sub">Via ${esc(det.via)}. <b>GrowthDB has no measured growth data for this species</b>, so a database-backed validation isn't possible. You can still validate by entering your own measurements and medium.</div>`; const b = el('button', 'ac-btn primary', 'Enter my own measurements →'); b.style.marginTop = '10px'; b.onclick = () => showNoData(det.name); bn.appendChild(b); q.value = det.name; }
+      else { bn.innerHTML = `<h3>Best guess: <i>${esc(det.name)}</i></h3><div class="sub">Read from the model name (low confidence). Confirm below or search for a different organism.</div>`; q.value = det.name; showHits(); }
+    }
+    navCount('validate', '✓', 'info');
   });
-  navCount('validate', GDB ? '✓' : '—', 'info');
+  navCount('validate', '…', 'info');
 }
-function o2Aerobic(rec) { const o = (rec.cond.o2 || '').toLowerCase(); return /aerob|oxic/.test(o) && !/anaerob|anoxic|micro/.test(o); }
+function o2Aerobic(rec) { const o = ((rec.cond && rec.cond.o2) || '').toLowerCase(); return /aerob|oxic/.test(o) && !/anaerob|anoxic|micro/.test(o); }
 function showRecords(sp) {
   const results = $('val-results'); results.innerHTML = '';
   const idxs = GDB.bySpecies[sp] || [];
-  const head = el('div', 'ac-card'); head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3><div class="sub">Pick a condition to simulate. Growth rate μ is compared directly with the FBA biomass flux (both h⁻¹); secretion is compared as a pattern (measured units are mM/h).</div>`;
+  if (!idxs.length) { showNoData(sp); return; }
+  const head = el('div', 'ac-card'); head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3><div class="sub">Pick a condition to load into the editable simulator. μ is compared directly with the FBA biomass flux (both h⁻¹).</div>`;
+  const mb = el('button', 'ac-btn', '✎ Skip — enter my own condition'); mb.style.marginTop = '8px'; mb.onclick = () => showNoData(sp); head.appendChild(mb);
   results.appendChild(head);
   const list = el('div', 'ac-issues');
   idxs.forEach(i => {
@@ -635,58 +682,106 @@ function showRecords(sp) {
     const txt = el('div', 'txt'); txt.style.flex = '1';
     txt.innerHTML = `<div class="ttl">${r.mu != null ? 'μ = <b>' + r.mu + '</b> h⁻¹' : (r.dt ? 'doubling ' + r.dt + ' h' : 'rates only')}${r.med.name ? ' · <span style="color:var(--ink-2)">' + esc(r.med.name) + '</span>' : ''}</div>
       <div class="note" style="font-size:12px">${cond ? esc(cond) + ' — ' : ''}${subs ? 'uptake: ' + subs + '. ' : ''}${prods ? 'secretes: ' + prods + '. ' : ''}${r.cit ? '<span style="color:var(--ink-3)">' + esc(r.cit) + '</span>' : ''}</div>`;
-    const act = el('div', 'ac-acts'); const sim = el('button', 'ac-btn primary', '▶ Simulate'); sim.onclick = () => runValidation(i, row); act.appendChild(sim);
+    const act = el('div', 'ac-acts'); const sim = el('button', 'ac-btn primary', 'Load & edit →'); sim.onclick = () => renderCondition(conditionFromRecord(i)); act.appendChild(sim);
     row.append(txt, act); list.appendChild(row);
   });
   results.appendChild(list);
+}
+function showNoData(name) {
+  const results = $('val-results'); results.innerHTML = '';
+  renderCondition(blankCondition(name || 'your strain'), true);
 }
 function exIndexByMet(model) {
   const idx = {};
   model.rxns.forEach(r => { if (!isExchange(r)) return; const mid = Object.keys(r.s)[0]; if (!mid) return; const m = model.mets.find(x => x.id === mid); const b = m ? (m.canon ? m.canon.bigg : baseId(m.id)) : baseId(mid); if (b && !(b in idx)) idx[b] = r.id; });
   return idx;
 }
-const INORGANIC = ['h2o', 'h', 'pi', 'nh4', 'so4', 'k', 'na1', 'mg2', 'ca2', 'fe2', 'fe3', 'cl', 'co2', 'mobd', 'cu2', 'mn2', 'zn2', 'ni2', 'cobalt2', 'cbl1', 'sel', 'slnt', 'tungs', 'mobd'];
+const INORGANIC = ['h2o', 'h', 'pi', 'nh4', 'so4', 'k', 'na1', 'mg2', 'ca2', 'fe2', 'fe3', 'cl', 'co2', 'mobd', 'cu2', 'mn2', 'zn2', 'ni2', 'cobalt2', 'cbl1', 'sel', 'slnt', 'tungs'];
+const INORG_SET = new Set(INORGANIC.concat(['o2']));
+const CARBON_UPTAKE = 10;
 function metOfExId(exId) { return exId.replace(/^R_/, '').replace(/^EX_/i, '').replace(/_[a-z0-9]+$/i, ''); }
-function buildMediaOverrides(model, rec, exByMet) {
-  const ov = {};
-  model.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });   // close all uptake
-  const open = (bigg, lb) => { const rid = exByMet[bigg]; if (rid) ov[rid] = { lb: lb, ub: 1000 }; };
-  INORGANIC.forEach(b => open(b, -1000));
-  if (o2Aerobic(rec)) open('o2', -1000);                       // O2 only when aerobic
-  const INORG = new Set(INORGANIC.concat(['o2']));
-  // ions/inorganics are unlimited (-1000); organic (carbon/energy) sources are capped at a
-  // standard -10 mmol gDW⁻¹ h⁻¹ so μ_max is a realistic prediction, not a solvent-limited maximum.
-  const CARBON_UPTAKE = 10;
-  let mediaBound = 0, carbonBound = false;
-  if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); if (exByMet[b]) { open(b, INORG.has(b) ? -1000 : -CARBON_UPTAKE); mediaBound++; if (!INORG.has(b)) carbonBound = true; } });
-  // measured substrates (mM/h units aren't specific rates, so normalise to the same cap)
-  rec.up.forEach(u => { if (u.met && exByMet[u.met]) { open(u.met, INORG.has(u.met) ? -1000 : -CARBON_UPTAKE); if (!INORG.has(u.met)) carbonBound = true; } });
-  return { ov, mediaBound, carbonBound };
+function metName(model, bigg, exId) { const mid = Object.keys((model.rxns.find(r => r.id === exId) || { s: {} }).s)[0]; const m = mid && model.mets.find(x => x.id === mid); return (m && m.name && m.name !== m.id) ? m.name : bigg; }
+// build an editable condition from a GrowthDB record: inorganics + medium + measured (experimental) uptakes
+function conditionFromRecord(idx) {
+  const rec = GDB.records[idx]; const exByMet = exIndexByMet(MODEL);
+  const rows = [], seen = new Set(); const miss = [];
+  const add = (met, lb, src, meas) => { const ex = exByMet[met]; if (!ex) { if (src === 'exp') miss.push(met); return null; } if (seen.has(ex)) return rows.find(r => r.ex === ex); seen.add(ex); const row = { ex, met, name: metName(MODEL, met, ex), lb, ub: 1000, src, meas: meas || null }; rows.push(row); return row; };
+  INORGANIC.forEach(b => add(b, -1000, 'inorg'));
+  if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
+  if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
+  rec.up.forEach(u => { if (!u.met) return; const row = add(u.met, INORG_SET.has(u.met) ? -1000 : -CARBON_UPTAKE, 'exp', { r: u.r, u: u.u }); if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u }; if (!INORG_SET.has(u.met) && row.lb >= 0) row.lb = -CARBON_UPTAKE; } });
+  return { species: rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false };
 }
-async function runValidation(i, row) {
-  const rec = GDB.records[i];
-  const panel = $('val-results');
-  let card = document.getElementById('val-out'); if (card) card.remove();
-  card = el('div', 'ac-card'); card.id = 'val-out'; card.innerHTML = `<h3>Simulating…</h3><div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Binding medium and solving FBA…</span></div>`;
-  panel.appendChild(card); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+function blankCondition(species) {
+  const exByMet = exIndexByMet(MODEL); const rows = [], seen = new Set();
+  const add = (met, lb, src) => { const ex = exByMet[met]; if (!ex || seen.has(ex)) return; seen.add(ex); rows.push({ ex, met, name: metName(MODEL, met, ex), lb, ub: 1000, src, meas: null }); };
+  INORGANIC.forEach(b => add(b, -1000, 'inorg')); add('o2', -1000, 'inorg');
+  return { species, mu: null, rows, sec: [], miss: [], cit: null, doi: null, medName: null, manual: true };
+}
+const SRC_BADGE = { exp: ['experimental', '#15803D'], medium: ['medium', '#2563EB'], inorg: ['mineral', '#64748B'], manual: ['manual', '#7C3AED'] };
+function renderCondition(cond, isManual) {
+  const results = $('val-results');
+  let card = document.getElementById('val-cond'); if (card) card.remove();
+  card = el('div', 'ac-card'); card.id = 'val-cond';
+  const exOpts = Object.entries(exIndexByMet(MODEL));
+  card.innerHTML = `<h3>${cond.manual ? 'Your condition' : 'Condition'} — <i>${esc(cond.species)}</i>${cond.medName ? ' · <span style="color:var(--ink-2);font-weight:400">' + esc(cond.medName) + '</span>' : ''}</h3>
+    <div class="sub">${cond.manual ? 'No GrowthDB data — enter your measured growth rate and formulate the medium by choosing exchanges and fluxes.' : 'Edit any flux before simulating. Negative = uptake (mmol gDW⁻¹ h⁻¹). Rows from measured GrowthDB rates are tagged <b>experimental</b>; medium/mineral rows are <b>pre-set (no experimental backup)</b>.'}</div>
+    <div style="display:flex;align-items:center;gap:10px;margin:12px 0 6px"><label style="font-size:13px;color:var(--ink-2)">Measured μ (h⁻¹):</label><input id="val-mu" type="number" step="0.01" min="0" placeholder="unknown" value="${cond.mu == null ? '' : cond.mu}" style="width:110px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">${cond.mu == null ? '<span style="font-size:11.5px;color:var(--ink-3)">leave blank for a qualitative growth check</span>' : '<span style="font-size:11.5px;color:#15803D">experimental</span>'}</div>`;
+  const tbl = el('div', ''); tbl.id = 'val-tbl'; card.appendChild(tbl);
+  // add-exchange control
+  const addbar = el('div', ''); addbar.style.cssText = 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center';
+  const sel = el('select', ''); sel.style.cssText = 'flex:1;min-width:200px;max-width:340px;padding:7px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink);font-size:13px';
+  sel.innerHTML = '<option value="">+ add exchange…</option>' + exOpts.map(([met, ex]) => `<option value="${esc(ex)}|${esc(met)}">${esc(met)} — ${esc(ex)}</option>`).join('');
+  const fluxIn = el('input', ''); fluxIn.type = 'number'; fluxIn.step = 'any'; fluxIn.value = '-10'; fluxIn.style.cssText = 'width:90px;padding:7px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)';
+  const addBtn = el('button', 'ac-btn', 'Add'); addBtn.onclick = () => { if (!sel.value) return; const [ex, met] = sel.value.split('|'); if (cond.rows.some(r => r.ex === ex)) { cond.rows.find(r => r.ex === ex).lb = +fluxIn.value; } else cond.rows.push({ ex, met, name: metName(MODEL, met, ex), lb: +fluxIn.value, ub: 1000, src: 'manual', meas: null }); drawTbl(); sel.value = ''; };
+  addbar.append(sel, fluxIn, addBtn); card.appendChild(addbar);
+  // run
+  const run = el('button', 'ac-btn primary', '▶ Run simulation'); run.style.marginTop = '14px'; run.onclick = () => { const mv = $('val-mu').value; cond.mu = mv === '' ? null : +mv; runCondition(cond); };
+  card.appendChild(run);
+  const out = el('div', ''); out.id = 'val-out-wrap'; card.appendChild(out);
+  results.appendChild(card);
+  const drawTbl = () => {
+    tbl.innerHTML = `<div style="display:grid;grid-template-columns:1.5fr 96px 1fr 26px;gap:8px;font-size:11px;color:var(--ink-3);font-weight:600;padding:2px 0;border-bottom:1px solid var(--line)"><div>EXCHANGE</div><div>FLUX (lb)</div><div>SOURCE</div><div></div></div>`;
+    cond.rows.forEach((row, i) => {
+      const r = el('div', ''); r.style.cssText = 'display:grid;grid-template-columns:1.5fr 96px 1fr 26px;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--line)';
+      const badge = SRC_BADGE[row.src] || SRC_BADGE.manual;
+      const measTxt = row.src === 'exp' && row.meas ? `measured ${row.meas.r} ${esc(row.meas.u || '')}` : (row.src === 'inorg' ? 'unlimited mineral' : 'pre-set, no experimental backup');
+      r.innerHTML = `<div style="font-size:12.5px"><code>${esc(row.met)}</code> <span style="color:var(--ink-3);font-size:11px">${esc(row.name && row.name !== row.met ? row.name : row.ex)}</span></div>
+        <input type="number" step="any" value="${row.lb}" data-i="${i}" style="width:88px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--ink)">
+        <div style="font-size:11.5px"><span style="display:inline-block;padding:2px 8px;border-radius:10px;color:#fff;background:${badge[1]};font-size:10.5px;font-weight:600">${badge[0]}</span> <span style="color:var(--ink-3)">${measTxt}</span></div>
+        <button data-del="${i}" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:14px">✕</button>`;
+      tbl.appendChild(r);
+    });
+    tbl.querySelectorAll('input[data-i]').forEach(inp => inp.oninput = () => { cond.rows[+inp.dataset.i].lb = +inp.value; });
+    tbl.querySelectorAll('button[data-del]').forEach(b => b.onclick = () => { cond.rows.splice(+b.dataset.del, 1); drawTbl(); });
+  };
+  drawTbl();
+  if (cond.miss && cond.miss.length) card.insertBefore(el('div', '', `<div style="font-size:11.5px;color:#B45309;margin:8px 0">Note: measured substrate${cond.miss.length > 1 ? 's' : ''} <b>${cond.miss.map(esc).join(', ')}</b> ${cond.miss.length > 1 ? 'have' : 'has'} no exchange in this model and could not be bound.</div>`), tbl);
+}
+async function runCondition(cond) {
+  const wrap = $('val-out-wrap'); wrap.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center;margin-top:14px"><div class="ac-spin"></div><span>Solving FBA…</span></div>`;
   await new Promise(r => setTimeout(r, 30));
   const bio = findBiomass(MODEL);
-  if (!bio) { card.innerHTML = '<h3>Simulation</h3><div class="ac-empty">No biomass/objective reaction found in this model — cannot predict growth.</div>'; return; }
+  if (!bio) { wrap.innerHTML = '<div class="ac-empty" style="margin-top:14px">No biomass/objective reaction found in this model — cannot predict growth.</div>'; return; }
+  const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
+  let carbon = false; cond.rows.forEach(row => { if (!row.ex) return; ov[row.ex] = { lb: row.lb, ub: row.ub == null ? 1000 : row.ub }; if (row.lb < -1e-9 && !INORG_SET.has(row.met)) carbon = true; });
+  const boundN = cond.rows.filter(r => r.lb < -1e-9).length;
+  const card = el('div', 'ac-card'); card.id = 'val-out'; card.style.marginTop = '14px';
   const exByMet = exIndexByMet(MODEL);
-  const { ov, mediaBound, carbonBound } = buildMediaOverrides(MODEL, rec, exByMet);
-  if (!carbonBound) { renderValidationResult(card, rec, { predMu: 0, mediaBound, bio, secCheck: [], feasible: false, noCarbon: true }); navCount('validate', '✓', 'info'); return; }
+  if (!carbon) { wrap.innerHTML = ''; wrap.appendChild(card); renderValidationResult(card, cond, { predMu: 0, mediaBound: boundN, bio, secCheck: [], feasible: false, noCarbon: true }); return; }
   const res = await fba(MODEL, bio.id, ov);
   const predMu = Math.max(0, res.obj);
-  // secretion pattern: does the model carry positive flux out of the measured products?
-  const secCheck = rec.sec.map(pmet => { const rid = exByMet[pmet.met]; const flux = rid ? (res.vars[rid] || 0) : null; return { met: pmet.met, ex: rid, measured: pmet.r, predFlux: flux == null ? null : +flux.toFixed(3), secreted: flux != null && flux > 1e-6 }; });
-  renderValidationResult(card, rec, { predMu, mediaBound, bio, secCheck, feasible: res.obj > 1e-6 });
+  const secCheck = cond.sec.map(p => { const rid = exByMet[p.met]; const flux = rid ? (res.vars[rid] || 0) : null; return { met: p.met, ex: rid, measured: p.r, u: p.u, predFlux: flux == null ? null : +flux.toFixed(3), secreted: flux != null && flux > 1e-6 }; });
+  wrap.innerHTML = ''; wrap.appendChild(card);
+  renderValidationResult(card, cond, { predMu, mediaBound: boundN, bio, secCheck, feasible: res.obj > 1e-6 });
   navCount('validate', '✓', predMu > 1e-6 ? 'ok' : 'warn');
 }
 function renderValidationResult(card, rec, R) {
   const mu = rec.mu, pred = +R.predMu.toFixed(4);
+  const spName = rec.species || rec.sp;
   let verdict, vcls, vtext;
-  if (R.noCarbon) { card.innerHTML = ''; card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(rec.sp)}</i>`));
-    card.appendChild(el('div', 'ac-empty', `<span class="big">—</span>This GrowthDB record carries no linked medium and no measured uptake whose exchange exists in <b>${esc(MODEL.id || 'this model')}</b>, so no carbon source could be bound. Simulation skipped — pick a record with a medium or an uptake substrate the model can import.${rec.cit ? '<div style="font-size:11.5px;color:var(--ink-3);margin-top:10px">Source: ' + esc(rec.cit) + '</div>' : ''}`));
+  if (R.noCarbon) { card.innerHTML = ''; card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(spName)}</i>`));
+    card.appendChild(el('div', 'ac-empty', `<span class="big">—</span>No carbon/energy source with a negative flux is bound to an exchange that exists in <b>${esc(MODEL.id || 'this model')}</b>, so growth cannot be predicted. Add an organic exchange (uptake, negative flux) to the table above.`));
     return; }
   if (mu == null) { verdict = R.feasible ? 'Grows' : 'No growth'; vcls = R.feasible ? 'ok' : 'bad';
     vtext = R.feasible ? `The model grows on this medium (μ<sub>max</sub> = ${pred} h⁻¹). No measured μ in this record to compare against — the qualitative growth call is the check.` : `The model cannot grow on this medium — check that the reported carbon source has an exchange and pathway in the model.`; }
@@ -699,8 +794,8 @@ function renderValidationResult(card, rec, R) {
   }
   const secGood = R.secCheck.filter(x => x.secreted).length, secTot = R.secCheck.length;
   card.innerHTML = '';
-  card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(rec.sp)}</i>`));
-  card.appendChild(el('div', 'ac-kpis', kpi(mu == null ? '—' : mu, 'measured μ (h⁻¹)', 'info') + kpi(pred, 'predicted μ_max (h⁻¹)', vcls) + kpi(`${secGood}/${secTot}`, 'secretion products reproduced', secTot ? (secGood === secTot ? 'ok' : 'warn') : 'info') + kpi(R.mediaBound, 'medium exchanges bound', 'info')));
+  card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(spName)}</i>`));
+  card.appendChild(el('div', 'ac-kpis', kpi(mu == null ? '—' : mu, 'measured μ (h⁻¹)', 'info') + kpi(pred, 'predicted μ_max (h⁻¹)', vcls) + kpi(`${secGood}/${secTot}`, 'secretion products reproduced', secTot ? (secGood === secTot ? 'ok' : 'warn') : 'info') + kpi(R.mediaBound, 'exchanges taking up flux', 'info')));
   const bcol = { ok: '#15803D', warn: '#B45309', bad: '#DC2626', info: '#2563EB' }[vcls] || '#2563EB';
   const chip = el('div', ''); chip.style.cssText = 'margin:4px 0 12px'; chip.innerHTML = `<span style="display:inline-block;padding:5px 14px;border-radius:14px;font-weight:600;font-size:13px;color:#fff;background:${bcol}">${verdict}</span>`;
   card.appendChild(chip);
@@ -709,7 +804,7 @@ function renderValidationResult(card, rec, R) {
   if (secTot) {
     const st = el('div', ''); st.style.marginTop = '10px';
     st.innerHTML = '<div style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px"><b>Secretion pattern</b> (does the model route flux to each measured by-product?):</div>' +
-      R.secCheck.map(x => `<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:12px;font-size:12.5px;background:var(--surface-2);border:1px solid var(--line)">${x.secreted ? '✓' : (x.ex ? '✕' : '—')} <b>${esc(x.met)}</b> <span style="color:var(--ink-3)">meas ${x.measured} ${esc(rec.sec.find(s=>s.met===x.met)?.u||'')}${x.ex ? '; model ' + (x.predFlux != null ? x.predFlux : 'n/a') : '; no exchange in model'}</span></span>`).join('');
+      R.secCheck.map(x => `<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:12px;font-size:12.5px;background:var(--surface-2);border:1px solid var(--line)">${x.secreted ? '✓' : (x.ex ? '✕' : '—')} <b>${esc(x.met)}</b> <span style="color:var(--ink-3)">meas ${x.measured} ${esc(x.u || '')}${x.ex ? '; model ' + (x.predFlux != null ? x.predFlux : 'n/a') : '; no exchange in model'}</span></span>`).join('');
     card.appendChild(st);
   }
   if (rec.cit) card.appendChild(el('div', '', `<div style="font-size:11.5px;color:var(--ink-3);margin-top:12px;border-top:1px solid var(--line);padding-top:8px">Source: ${esc(rec.cit)}${rec.doi ? ' · <a href="https://doi.org/' + esc(rec.doi) + '" target="_blank" rel="noopener" style="color:var(--primary-2)">doi:' + esc(rec.doi) + '</a>' : ''}</div>`));
