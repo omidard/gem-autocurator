@@ -224,6 +224,18 @@ async function detectEGC(model) {
   const carriers = val > 1e-6 && r.result.vars ? Object.entries(r.result.vars).filter(([k, v]) => k !== '__EGC_ATP__' && Math.abs(v) > 1e-6).map(([k, v]) => ({ id: k, flux: +v.toFixed(2) })).sort((a, b) => Math.abs(b.flux) - Math.abs(a.flux)).slice(0, 40) : [];
   return { tested: true, egc: val > 1e-6, atpFlux: +val.toFixed(2), carriers };
 }
+/* Flux-balance analysis: maximise objId, return objective + full flux vector. */
+async function fba(model, objId, ov) {
+  const g = await glpk(); const lp = buildLP(g, model, ov);
+  lp.objective = { direction: g.GLP_MAX, name: 'z', vars: [{ name: objId, coef: 1 }] };
+  const r = await g.solve(lp, { msglev: g.GLP_MSG_OFF, presol: true });
+  return { obj: (r.result && r.result.z) || 0, vars: (r.result && r.result.vars) || {}, status: r.result ? r.result.status : 0 };
+}
+function findBiomass(model) {
+  const bios = model.rxns.filter(isBiomass);
+  const pool = (bios.length ? bios : model.rxns.filter(r => !isExchange(r)));
+  return pool.slice().sort((a, b) => Object.keys(b.s).length - Object.keys(a.s).length)[0] || null;
+}
 /* proton/water balancing: can the reaction be balanced by adding x H+ and y H2O? returns fix or null */
 function protonWaterFix(bal, cbal) {
   const H = bal.H || 0, O = bal.O || 0;                 // products - reactants imbalance
@@ -560,11 +572,168 @@ function directionalityIssues(model) {
   RESULT.thermo.dirScanned = scanned; RESULT.thermo.dirStricter = stricter;
   return out;
 }
-function renderValidate() { roadmap('validate', 'Lab validation', [
-  '<b>Strain match</b> — type your strain; we fuzzy-match it against <b>GrowthDB</b> (typo-tolerant, with close hits shown) and import its measured growth / uptake / secretion rates.',
-  '<b>Media</b> — the exact growth medium of each measurement is resolved from <b>MediaDB</b> (13k media) and bound onto the model.',
-  '<b>GAM / NGAM</b> — growth- and non-growth-associated maintenance are fitted from the GrowthDB rate series.',
-  '<b>Prediction vs experiment</b> — every condition with lab data is simulated and compared, with a designed figure + interpretation.']); navCount('validate', '—', 'info'); }
+/* ---------------- lab validation (GrowthDB × MediaDB × FBA) ---------------- */
+let GDB = null, MEDIA = null;   // lazy-loaded bundles
+const _valState = { sp: null, query: '' };
+async function loadValidation() {
+  if (GDB) return;
+  const [g, m] = await Promise.all([
+    fetch('data/growthdb.json').then(r => r.json()).catch(() => ({ species: [], records: [] })),
+    fetch('data/media_ex.json').then(r => r.json()).catch(() => ({})),
+  ]);
+  GDB = g; MEDIA = m;
+  // group records by species for fast lookup
+  GDB.bySpecies = {}; GDB.records.forEach((r, i) => { (GDB.bySpecies[r.sp] = GDB.bySpecies[r.sp] || []).push(i); });
+}
+// lightweight fuzzy score: normalized token/substring match (typo-tolerant via edit distance on words)
+function editDist(a, b) { const m = a.length, n = b.length; if (!m || !n) return Math.max(m, n); const d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]); for (let j = 0; j <= n; j++) d[0][j] = j; for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[m][n]; }
+function matchSpecies(query, limit) {
+  const q = query.toLowerCase().trim(); if (!q) return [];
+  const qt = q.split(/\s+/);
+  return GDB.species.map(sp => {
+    const s = sp.toLowerCase();
+    let score = 0;
+    if (s === q) score = 100; else if (s.startsWith(q)) score = 80; else if (s.includes(q)) score = 60;
+    else { const st = s.split(/\s+/); let hit = 0; qt.forEach(w => { if (st.some(x => x === w || (w.length > 3 && x.startsWith(w)) || editDist(w, x) <= 1)) hit++; }); score = hit ? 30 + 12 * hit - Math.min(20, editDist(q, s)) : 0; }
+    return { sp, score, n: (GDB.bySpecies[sp] || []).length };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score || b.n - a.n).slice(0, limit || 8);
+}
+function renderValidate() {
+  const s = $('stage-validate'); s.innerHTML = '';
+  s.appendChild(el('div', 'ac-sh', `<h2>Lab validation</h2><p>Match your organism against <b>GrowthDB</b> (measured growth / uptake / secretion, literature-sourced), bind the reported medium from the <b>Media DB</b>, and simulate — the model's predicted growth rate and secretion are compared against the experiment with the bundled GLPK solver.</p>`));
+  const box = el('div', 'ac-card'); box.innerHTML = `<h3>Find your organism</h3><div class="sub">Type a species or strain name — matching is typo-tolerant and shows the closest hits in GrowthDB.</div>
+    <input id="val-q" type="text" placeholder="e.g. Escherichia coli, B. subtilis, Ruminococcus…" style="width:100%;margin-top:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);font-size:14px">
+    <div id="val-hits" style="margin-top:10px"></div>`;
+  s.appendChild(box);
+  const results = el('div', ''); results.id = 'val-results'; s.appendChild(results);
+  const loading = el('div', 'ac-load'); loading.style.cssText = 'display:flex;gap:10px;align-items:center;color:var(--ink-2);font-size:13px'; loading.innerHTML = '<div class="ac-spin"></div> Loading GrowthDB & Media DB…';
+  s.appendChild(loading);
+  loadValidation().then(() => {
+    loading.remove();
+    box.querySelector('.sub').innerHTML += ` <b>${fmt(GDB.records.length)}</b> records across <b>${fmt(GDB.species.length)}</b> species loaded.`;
+    const q = $('val-q'), hits = $('val-hits');
+    const showHits = () => {
+      const m = matchSpecies(q.value, 8); hits.innerHTML = '';
+      if (!q.value.trim()) return;
+      if (!m.length) { hits.innerHTML = `<div class="ac-empty" style="padding:10px">No GrowthDB species matches “${esc(q.value)}”. Try a genus, or a different spelling.</div>`; return; }
+      m.forEach(h => { const b = el('button', 'ac-chip'); b.style.cssText = 'margin:3px 6px 3px 0;padding:6px 11px;border:1px solid var(--line);border-radius:16px;background:var(--surface-2);color:var(--ink);cursor:pointer;font-size:13px';
+        b.innerHTML = `<i>${esc(h.sp)}</i> <span style="color:var(--primary-2);font-weight:600">${h.n}</span>`;
+        b.onclick = () => { _valState.sp = h.sp; showRecords(h.sp); }; hits.appendChild(b); });
+    };
+    q.oninput = showHits; q.value = _valState.query || ''; if (q.value) showHits();
+    if (_valState.sp) showRecords(_valState.sp);
+    q.addEventListener('input', () => { _valState.query = q.value; });
+  });
+  navCount('validate', GDB ? '✓' : '—', 'info');
+}
+function o2Aerobic(rec) { const o = (rec.cond.o2 || '').toLowerCase(); return /aerob|oxic/.test(o) && !/anaerob|anoxic|micro/.test(o); }
+function showRecords(sp) {
+  const results = $('val-results'); results.innerHTML = '';
+  const idxs = GDB.bySpecies[sp] || [];
+  const head = el('div', 'ac-card'); head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3><div class="sub">Pick a condition to simulate. Growth rate μ is compared directly with the FBA biomass flux (both h⁻¹); secretion is compared as a pattern (measured units are mM/h).</div>`;
+  results.appendChild(head);
+  const list = el('div', 'ac-issues');
+  idxs.forEach(i => {
+    const r = GDB.records[i];
+    const row = el('div', 'ac-issue sev-info'); row.style.cursor = 'default';
+    const subs = r.up.map(u => esc(u.met || u.ex)).join(', '), prods = r.sec.map(u => esc(u.met || u.ex)).join(', ');
+    const cond = [r.cond.o2, r.cond.mode, r.cond.t != null ? r.cond.t + '°C' : null, r.cond.pH != null ? 'pH ' + r.cond.pH : null].filter(Boolean).join(' · ');
+    const txt = el('div', 'txt'); txt.style.flex = '1';
+    txt.innerHTML = `<div class="ttl">${r.mu != null ? 'μ = <b>' + r.mu + '</b> h⁻¹' : (r.dt ? 'doubling ' + r.dt + ' h' : 'rates only')}${r.med.name ? ' · <span style="color:var(--ink-2)">' + esc(r.med.name) + '</span>' : ''}</div>
+      <div class="note" style="font-size:12px">${cond ? esc(cond) + ' — ' : ''}${subs ? 'uptake: ' + subs + '. ' : ''}${prods ? 'secretes: ' + prods + '. ' : ''}${r.cit ? '<span style="color:var(--ink-3)">' + esc(r.cit) + '</span>' : ''}</div>`;
+    const act = el('div', 'ac-acts'); const sim = el('button', 'ac-btn primary', '▶ Simulate'); sim.onclick = () => runValidation(i, row); act.appendChild(sim);
+    row.append(txt, act); list.appendChild(row);
+  });
+  results.appendChild(list);
+}
+function exIndexByMet(model) {
+  const idx = {};
+  model.rxns.forEach(r => { if (!isExchange(r)) return; const mid = Object.keys(r.s)[0]; if (!mid) return; const m = model.mets.find(x => x.id === mid); const b = m ? (m.canon ? m.canon.bigg : baseId(m.id)) : baseId(mid); if (b && !(b in idx)) idx[b] = r.id; });
+  return idx;
+}
+const INORGANIC = ['h2o', 'h', 'pi', 'nh4', 'so4', 'k', 'na1', 'mg2', 'ca2', 'fe2', 'fe3', 'cl', 'co2', 'mobd', 'cu2', 'mn2', 'zn2', 'ni2', 'cobalt2', 'cbl1', 'sel', 'slnt', 'tungs', 'mobd'];
+function metOfExId(exId) { return exId.replace(/^R_/, '').replace(/^EX_/i, '').replace(/_[a-z0-9]+$/i, ''); }
+function buildMediaOverrides(model, rec, exByMet) {
+  const ov = {};
+  model.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });   // close all uptake
+  const open = (bigg, lb) => { const rid = exByMet[bigg]; if (rid) ov[rid] = { lb: lb, ub: 1000 }; };
+  INORGANIC.forEach(b => open(b, -1000));
+  if (o2Aerobic(rec)) open('o2', -1000);                       // O2 only when aerobic
+  const INORG = new Set(INORGANIC.concat(['o2']));
+  // ions/inorganics are unlimited (-1000); organic (carbon/energy) sources are capped at a
+  // standard -10 mmol gDW⁻¹ h⁻¹ so μ_max is a realistic prediction, not a solvent-limited maximum.
+  const CARBON_UPTAKE = 10;
+  let mediaBound = 0, carbonBound = false;
+  if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); if (exByMet[b]) { open(b, INORG.has(b) ? -1000 : -CARBON_UPTAKE); mediaBound++; if (!INORG.has(b)) carbonBound = true; } });
+  // measured substrates (mM/h units aren't specific rates, so normalise to the same cap)
+  rec.up.forEach(u => { if (u.met && exByMet[u.met]) { open(u.met, INORG.has(u.met) ? -1000 : -CARBON_UPTAKE); if (!INORG.has(u.met)) carbonBound = true; } });
+  return { ov, mediaBound, carbonBound };
+}
+async function runValidation(i, row) {
+  const rec = GDB.records[i];
+  const panel = $('val-results');
+  let card = document.getElementById('val-out'); if (card) card.remove();
+  card = el('div', 'ac-card'); card.id = 'val-out'; card.innerHTML = `<h3>Simulating…</h3><div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Binding medium and solving FBA…</span></div>`;
+  panel.appendChild(card); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  await new Promise(r => setTimeout(r, 30));
+  const bio = findBiomass(MODEL);
+  if (!bio) { card.innerHTML = '<h3>Simulation</h3><div class="ac-empty">No biomass/objective reaction found in this model — cannot predict growth.</div>'; return; }
+  const exByMet = exIndexByMet(MODEL);
+  const { ov, mediaBound, carbonBound } = buildMediaOverrides(MODEL, rec, exByMet);
+  if (!carbonBound) { renderValidationResult(card, rec, { predMu: 0, mediaBound, bio, secCheck: [], feasible: false, noCarbon: true }); navCount('validate', '✓', 'info'); return; }
+  const res = await fba(MODEL, bio.id, ov);
+  const predMu = Math.max(0, res.obj);
+  // secretion pattern: does the model carry positive flux out of the measured products?
+  const secCheck = rec.sec.map(pmet => { const rid = exByMet[pmet.met]; const flux = rid ? (res.vars[rid] || 0) : null; return { met: pmet.met, ex: rid, measured: pmet.r, predFlux: flux == null ? null : +flux.toFixed(3), secreted: flux != null && flux > 1e-6 }; });
+  renderValidationResult(card, rec, { predMu, mediaBound, bio, secCheck, feasible: res.obj > 1e-6 });
+  navCount('validate', '✓', predMu > 1e-6 ? 'ok' : 'warn');
+}
+function renderValidationResult(card, rec, R) {
+  const mu = rec.mu, pred = +R.predMu.toFixed(4);
+  let verdict, vcls, vtext;
+  if (R.noCarbon) { card.innerHTML = ''; card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(rec.sp)}</i>`));
+    card.appendChild(el('div', 'ac-empty', `<span class="big">—</span>This GrowthDB record carries no linked medium and no measured uptake whose exchange exists in <b>${esc(MODEL.id || 'this model')}</b>, so no carbon source could be bound. Simulation skipped — pick a record with a medium or an uptake substrate the model can import.${rec.cit ? '<div style="font-size:11.5px;color:var(--ink-3);margin-top:10px">Source: ' + esc(rec.cit) + '</div>' : ''}`));
+    return; }
+  if (mu == null) { verdict = R.feasible ? 'Grows' : 'No growth'; vcls = R.feasible ? 'ok' : 'bad';
+    vtext = R.feasible ? `The model grows on this medium (μ<sub>max</sub> = ${pred} h⁻¹). No measured μ in this record to compare against — the qualitative growth call is the check.` : `The model cannot grow on this medium — check that the reported carbon source has an exchange and pathway in the model.`; }
+  else if (!R.feasible) { verdict = 'False negative'; vcls = 'bad';
+    vtext = `The organism grew at μ = ${mu} h⁻¹ in the lab, but the model predicts <b>no growth</b> on this medium. Likely a gap: a missing transporter for the carbon source or a blocked biosynthetic route. See the Structural QC and Thermodynamics stages.`; }
+  else { const ratio = pred / mu; const pctErr = Math.abs(pred - mu) / mu * 100;
+    if (ratio >= 0.7 && ratio <= 1.45) { verdict = 'Consistent'; vcls = 'ok'; vtext = `Predicted μ<sub>max</sub> = ${pred} h⁻¹ is within ${Math.round(pctErr)}% of the measured ${mu} h⁻¹ — the model reproduces the observed growth on this medium.`; }
+    else if (ratio > 1.45) { verdict = 'Over-predicts'; vcls = 'warn'; vtext = `The model's μ<sub>max</sub> (${pred} h⁻¹) exceeds the measured ${mu} h⁻¹ by ${Math.round(ratio * 100 - 100)}%. FBA gives the theoretical maximum; the gap is expected but a large excess can flag a missing maintenance (NGAM/ATPM) constraint or an over-open medium.`; }
+    else { verdict = 'Under-predicts'; vcls = 'bad'; vtext = `The model's μ<sub>max</sub> (${pred} h⁻¹) is well below the measured ${mu} h⁻¹ — a likely gap in a biosynthetic pathway, or too tight a medium/uptake bound (uptake was normalised to 10 mmol gDW⁻¹ h⁻¹).`; }
+  }
+  const secGood = R.secCheck.filter(x => x.secreted).length, secTot = R.secCheck.length;
+  card.innerHTML = '';
+  card.appendChild(el('h3', '', `Prediction vs experiment — <i>${esc(rec.sp)}</i>`));
+  card.appendChild(el('div', 'ac-kpis', kpi(mu == null ? '—' : mu, 'measured μ (h⁻¹)', 'info') + kpi(pred, 'predicted μ_max (h⁻¹)', vcls) + kpi(`${secGood}/${secTot}`, 'secretion products reproduced', secTot ? (secGood === secTot ? 'ok' : 'warn') : 'info') + kpi(R.mediaBound, 'medium exchanges bound', 'info')));
+  const bcol = { ok: '#15803D', warn: '#B45309', bad: '#DC2626', info: '#2563EB' }[vcls] || '#2563EB';
+  const chip = el('div', ''); chip.style.cssText = 'margin:4px 0 12px'; chip.innerHTML = `<span style="display:inline-block;padding:5px 14px;border-radius:14px;font-weight:600;font-size:13px;color:#fff;background:${bcol}">${verdict}</span>`;
+  card.appendChild(chip);
+  const plot = el('div', 'ac-plot'); plot.id = 'val-plot'; plot.style.height = '230px'; card.appendChild(plot);
+  card.appendChild(el('div', 'ac-interp', vtext));
+  if (secTot) {
+    const st = el('div', ''); st.style.marginTop = '10px';
+    st.innerHTML = '<div style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px"><b>Secretion pattern</b> (does the model route flux to each measured by-product?):</div>' +
+      R.secCheck.map(x => `<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:12px;font-size:12.5px;background:var(--surface-2);border:1px solid var(--line)">${x.secreted ? '✓' : (x.ex ? '✕' : '—')} <b>${esc(x.met)}</b> <span style="color:var(--ink-3)">meas ${x.measured} ${esc(rec.sec.find(s=>s.met===x.met)?.u||'')}${x.ex ? '; model ' + (x.predFlux != null ? x.predFlux : 'n/a') : '; no exchange in model'}</span></span>`).join('');
+    card.appendChild(st);
+  }
+  if (rec.cit) card.appendChild(el('div', '', `<div style="font-size:11.5px;color:var(--ink-3);margin-top:12px;border-top:1px solid var(--line);padding-top:8px">Source: ${esc(rec.cit)}${rec.doi ? ' · <a href="https://doi.org/' + esc(rec.doi) + '" target="_blank" rel="noopener" style="color:var(--primary-2)">doi:' + esc(rec.doi) + '</a>' : ''}</div>`));
+  setTimeout(() => drawValPlot(rec, R, verdict, vcls), 30);
+}
+function drawValPlot(rec, R, verdict, vcls) {
+  if (!window.Plotly) return;
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const ink = dark ? '#C2CFE0' : '#334155';
+  const col = { ok: '#15803D', warn: '#B45309', bad: '#DC2626', info: '#2563EB' }[vcls] || '#2563EB';
+  const traces = [], hasMu = rec.mu != null;
+  const cats = [], meas = [], predv = [];
+  if (hasMu) { cats.push('growth μ (h⁻¹)'); meas.push(rec.mu); predv.push(+R.predMu.toFixed(4)); }
+  window.Plotly.newPlot('val-plot', [
+    { type: 'bar', name: 'measured', x: cats, y: meas, marker: { color: '#94A3B8' }, text: meas.map(v => v), textposition: 'outside', textfont: { size: 11 } },
+    { type: 'bar', name: 'predicted', x: cats, y: predv, marker: { color: col }, text: predv.map(v => v), textposition: 'outside', textfont: { size: 11 } },
+  ], { barmode: 'group', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { family: 'Fira Sans, sans-serif', size: 12, color: ink }, margin: { l: 48, r: 16, t: 30, b: 30 }, title: { text: 'Measured vs predicted growth rate', font: { size: 13 } }, legend: { orientation: 'h', y: 1.15, x: .5, xanchor: 'center' }, yaxis: { gridcolor: dark ? 'rgba(255,255,255,.08)' : '#EEF2F8', zeroline: false, rangemode: 'tozero' } }, { responsive: true, displayModeBar: false });
+}
 
 function renderReport() {
   const s = $('stage-report'); s.innerHTML = ''; const c = RESULT.counts;
