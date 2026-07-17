@@ -504,12 +504,6 @@ function renderCharge() {
   draw();
   return;
 }
-function roadmap(stage, title, items) {
-  const s = $('stage-' + stage); s.innerHTML = '';
-  s.appendChild(el('div', 'ac-sh', `<h2>${esc(title)}</h2>`));
-  const r = el('div', 'ac-roadmap'); r.innerHTML = `<h3>${esc(title)} <span class="tag">v2 — engine wiring in progress</span></h3><p style="font-size:13px;color:var(--ink-2);margin:6px 0 0">This stage uses the in-browser LP solver and our GrowthDB / MediaDB resources. The reference data and algorithm are specified; the interactive panel lands next.</p><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
-  s.appendChild(r);
-}
 function renderThermo() {
   const s = $('stage-thermo'); s.innerHTML = '';
   s.appendChild(el('div', 'ac-sh', `<h2>Thermodynamics &amp; cycles</h2><p>Flux-based checks solved live with the bundled GLPK-WASM LP solver: reactions that can never carry flux, and thermodynamically infeasible energy-generating cycles that let the model make ATP from nothing.</p>`));
