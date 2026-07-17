@@ -19,12 +19,14 @@ async function loadRef() {
   $('ac-load').style.display = 'flex';
   const setMsg = m => { const e = $('ac-load-msg'); if (e) e.textContent = m; };
   setMsg('Loading identifier maps (BiGG + KEGG + ModelSEED + MetaNetX)…');
-  const [met, rxn, props] = await Promise.all([
+  const [met, rxn, props, pka, thermo] = await Promise.all([
     fetch('data/metabolite_map.json').then(r => r.json()),
     fetch('data/reaction_map.json').then(r => r.json()),
     fetch('data/bigg_met_props.json').then(r => r.json()),
+    fetch('data/pka_table.json').then(r => r.json()).catch(() => ({})),
+    fetch('data/thermo_rxn.json').then(r => r.json()).catch(() => ({})),
   ]);
-  REF = { met, rxn, props };
+  REF = { met, rxn, props, pka, thermo };
   $('ac-load').style.display = 'none';
   return REF;
 }
@@ -204,6 +206,62 @@ function fixStr(fix, comp) {
   return parts.join(' and ');
 }
 
+/* ---------------- pH-dependent charge (Henderson-Hasselbalch, ModelSEED pKa) ----------------
+   The metabolite's model charge is the reference at pH 7. We apply the titration slope from
+   the compound's acid/base pKa sites, anchored so the recomputed charge equals the model
+   charge at pH 7 (keeps balanced reactions balanced at reference, flags real pH-induced shifts). */
+const DEFAULT_PH = 7.2, REF_PH = 7.2;   // BiGG charges are defined at pH 7.2; anchor there
+function pkaRec(met) {
+  const P = REF.pka; if (!P) return null;
+  const b = met.canon ? met.canon.bigg : baseId(met.id);
+  let rec = P['bigg:' + b];
+  if (!rec && met.anno) { const k = met.anno.kegg || met.anno['kegg.compound']; if (k) rec = P['kegg:' + k]; }
+  return rec || null;
+}
+function zSites(rec, pH) {                                   // absolute charge from pKa sites at pH
+  let z = 0;
+  if (rec.a) rec.a.forEach(a => z -= 1 / (1 + Math.pow(10, a - pH)));   // acid: deprotonates -> -1
+  if (rec.b) rec.b.forEach(bp => z += 1 / (1 + Math.pow(10, pH - bp))); // base: protonates -> +1
+  return z;
+}
+function chargeAtPH(met, refCharge, pH) {
+  if (refCharge == null) return null;
+  const rec = pkaRec(met);
+  if (!rec || Math.abs(pH - REF_PH) < 1e-9) return refCharge;
+  return refCharge + (zSites(rec, pH) - zSites(rec, REF_PH));
+}
+
+function computeMassCharge(model, pH) {
+  const massIss = [], chargeIss = [];
+  const byId = {}; model.mets.forEach(m => { byId[m.id] = m; });
+  const F = (mid) => { const m = byId[mid]; let f = (m && m.formula) || ''; if (!f && m && m.canon && REF.props[m.canon.bigg]) f = REF.props[m.canon.bigg].f; return parseFormula(f); };
+  const refCH = (m) => { if (m && m.charge != null) return m.charge; if (m && m.canon && REF.props[m.canon.bigg] && REF.props[m.canon.bigg].c != null) return REF.props[m.canon.bigg].c; return null; };
+  const CH = (mid) => { const m = byId[mid]; const q = refCH(m); return q == null ? null : chargeAtPH(m, q, pH); };
+  const compById = {}; model.mets.forEach(m => { compById[m.id] = m.compartment; });
+  const hIn = {}, h2oIn = {}; model.mets.forEach(m => { const b = m.canon ? m.canon.bigg : baseId(m.id); if (b === 'h') hIn[m.compartment] = m.id; if (b === 'h2o') h2oIn[m.compartment] = m.id; });
+  const titrated = Math.abs(pH - REF_PH) > 0.05;
+  const phTag = titrated ? ` at pH ${(+pH).toFixed(1)}` : '';
+  const chgTol = titrated ? 0.5 : 1e-3;   // at reference pH catch integer bugs; when titrated flag only ≥½-proton shifts
+  model.rxns.forEach(r => { if (isExchange(r) || isBiomass(r)) return;
+    const bal = {}; let known = true;
+    Object.entries(r.s).forEach(([mid, c]) => { const f = F(mid); if (!f || !Object.keys(f).length) known = false; Object.entries(f).forEach(([e, n]) => bal[e] = (bal[e] || 0) + c * n); });
+    let cbal = 0, ck = true; Object.entries(r.s).forEach(([mid, c]) => { const q = CH(mid); if (q == null) ck = false; else cbal += c * q; });
+    const massOff = known ? Object.entries(bal).filter(([e, v]) => Math.abs(v) > 1e-6) : [];
+    const chgOff = ck && Math.abs(cbal) > chgTol;
+    if (!massOff.length && !chgOff) return;
+    const comp = compById[Object.keys(r.s)[0]] || 'c';
+    const fix = (known && ck) ? protonWaterFix(bal, cbal) : null;
+    const canApply = fix && (!fix.h || hIn[comp]) && (!fix.h2o || h2oIn[comp]);
+    const fixTxt = fix ? (canApply ? ` — <b>fix:</b> add ${fixStr(fix, comp)}` : ' — a proton/water fix balances it, but the model lacks h/h2o in this compartment') : ' — not a proton/water imbalance; needs manual curation';
+    const applyObj = canApply ? { rxn: r.id, proton: fix, h: hIn[comp], h2o: h2oIn[comp] } : null;
+    if (massOff.length) massIss.push({ id: 'mass_' + r.id, cat: 'charge', sub: 'mass', sev: 'bad', kind: 'mass',
+      title: `Mass imbalance in <code>${esc(r.id)}</code>`, note: 'unbalanced: ' + massOff.map(([e, v]) => `${e}${v > 0 ? '+' : ''}${(+v.toFixed(2))}`).join(', ') + fixTxt, apply: applyObj });
+    else chargeIss.push({ id: 'chg_' + r.id, cat: 'charge', sub: 'charge', sev: 'warn', kind: 'charge',
+      title: `Charge imbalance in <code>${esc(r.id)}</code>${phTag}`, note: `net charge ${cbal > 0 ? '+' : ''}${(+cbal.toFixed(2))}` + fixTxt, apply: applyObj });
+  });
+  return { massIss, chargeIss };
+}
+
 function curate(model) {
   // --- identifiers ---
   let mBigg = 0, mLike = 0, mUn = 0;
@@ -246,32 +304,10 @@ function curate(model) {
       title: `Dead-end metabolite <code>${esc(m.id)}</code>`, note: `only ${prod[m.id] === 0 ? 'consumed, never produced' : 'produced, never consumed'} — cannot carry steady-state flux; blocks its reactions.`, apply: { flag: m.id } }); });
   const orphan = model.rxns.filter(r => !isExchange(r) && !(r.gpr && r.gpr.trim())).length;
 
-  // --- mass & charge imbalance ---
-  const massIss = [], chargeIss = [];
-  const byId = {}; model.mets.forEach(m => { byId[m.id] = m; });
-  const F = (mid) => { const m = byId[mid]; let f = (m && m.formula) || ''; if (!f && m && m.canon && REF.props[m.canon.bigg]) f = REF.props[m.canon.bigg].f; return parseFormula(f); };
-  const CH = (mid) => { const m = byId[mid]; if (m && m.charge != null) return m.charge; if (m && m.canon && REF.props[m.canon.bigg] && REF.props[m.canon.bigg].c != null) return REF.props[m.canon.bigg].c; return null; };
-  const compById = {}; model.mets.forEach(m => { compById[m.id] = m.compartment; });
-  const hIn = {}, h2oIn = {}; model.mets.forEach(m => { const b = m.canon ? m.canon.bigg : baseId(m.id); if (b === 'h') hIn[m.compartment] = m.id; if (b === 'h2o') h2oIn[m.compartment] = m.id; });
-  model.rxns.forEach(r => { if (isExchange(r) || isBiomass(r)) return;
-    const bal = {}; let known = true;
-    Object.entries(r.s).forEach(([mid, c]) => { const f = F(mid); if (!f || !Object.keys(f).length) known = false; Object.entries(f).forEach(([e, n]) => bal[e] = (bal[e] || 0) + c * n); });
-    let cbal = 0, ck = true; Object.entries(r.s).forEach(([mid, c]) => { const q = CH(mid); if (q == null) ck = false; else cbal += c * q; });
-    const massOff = known ? Object.entries(bal).filter(([e, v]) => Math.abs(v) > 1e-6) : [];
-    const chgOff = ck && Math.abs(cbal) > 1e-6;
-    if (!massOff.length && !chgOff) return;
-    const comp = compById[Object.keys(r.s)[0]] || 'c';
-    const fix = (known && ck) ? protonWaterFix(bal, cbal) : null;
-    const canApply = fix && (!fix.h || hIn[comp]) && (!fix.h2o || h2oIn[comp]);
-    const fixTxt = fix ? (canApply ? ` — <b>fix:</b> add ${fixStr(fix, comp)}` : ' — a proton/water fix balances it, but the model lacks h/h2o in this compartment') : ' — not a proton/water imbalance; needs manual curation';
-    const applyObj = canApply ? { rxn: r.id, proton: fix, h: hIn[comp], h2o: h2oIn[comp] } : null;
-    if (massOff.length) massIss.push({ id: 'mass_' + r.id, cat: 'charge', sub: 'mass', sev: 'bad', kind: 'mass',
-      title: `Mass imbalance in <code>${esc(r.id)}</code>`, note: 'unbalanced: ' + massOff.map(([e, v]) => `${e}${v > 0 ? '+' : ''}${(+v.toFixed(2))}`).join(', ') + fixTxt, apply: applyObj });
-    else chargeIss.push({ id: 'chg_' + r.id, cat: 'charge', sub: 'charge', sev: 'warn', kind: 'charge',
-      title: `Charge imbalance in <code>${esc(r.id)}</code>`, note: `net charge ${cbal > 0 ? '+' : ''}${(+cbal.toFixed(2))}` + fixTxt, apply: applyObj });
-  });
+  // --- mass & charge imbalance (charge is pH-dependent) ---
+  const { massIss, chargeIss } = computeMassCharge(model, DEFAULT_PH);
 
-  return { idIssues, discrep, structure, orphan, massIss, chargeIss,
+  return { idIssues, discrep, structure, orphan, massIss, chargeIss, ph: DEFAULT_PH,
     counts: { mBigg, mLike, mUn, rBigg, rLike, rUn, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
       exch: model.rxns.filter(isExchange).length, dead: structure.length, mass: massIss.length, charge: chargeIss.length,
       dupMet: discrep.filter(d => d.kind === 'dupmet').length, dupRxn: discrep.filter(d => d.kind === 'duprxn').length } };
@@ -385,18 +421,32 @@ function renderStructure() {
 }
 function renderCharge() {
   const s = $('stage-charge'); s.innerHTML = ''; const c = RESULT.counts;
-  s.appendChild(el('div', 'ac-sh', `<h2>Mass &amp; charge balance</h2><p>Every non-exchange reaction is checked for element and charge conservation. Charges follow the protonation state at your simulation pH.</p>`));
+  const covered = MODEL.mets.filter(m => pkaRec(m)).length, pct = MODEL.mets.length ? Math.round(100 * covered / MODEL.mets.length) : 0;
+  s.appendChild(el('div', 'ac-sh', `<h2>Mass &amp; charge balance</h2><p>Every non-exchange reaction is checked for element and charge conservation. Metabolite charges are recomputed at your simulation pH by Henderson-Hasselbalch over ModelSEED pKa sites, anchored to the model's charge at pH 7.2.</p>`));
   const phbar = el('div', 'ac-card');
-  phbar.innerHTML = `<h3>Simulation pH</h3><div class="sub">BiGG charges are defined at pH 7.2. Set the pH you will simulate at; a full pKa-microspecies recharge is on the roadmap — for now charge balance uses the reference protonation state.</div>
-    <div style="display:flex;align-items:center;gap:14px"><input type="range" id="ph-slider" min="4" max="9" step="0.1" value="7.2" style="flex:1"><span id="ph-val" class="tabular" style="font-size:20px;font-weight:700;color:var(--primary-2);min-width:52px">7.2</span></div>`;
+  phbar.innerHTML = `<h3>Simulation pH</h3><div class="sub">Charges titrate live as you move the slider: <b>${fmt(covered)}</b> of ${fmt(MODEL.mets.length)} metabolites (${pct}%) carry pKa data and re-charge; the rest keep their reference charge. Charge balance and the proton fixes below are recomputed at the chosen pH.</div>
+    <div style="display:flex;align-items:center;gap:14px;margin-top:10px"><span style="font-size:12px;color:var(--ink-2)">4</span><input type="range" id="ph-slider" min="4" max="10" step="0.1" value="${RESULT.ph}" style="flex:1"><span style="font-size:12px;color:var(--ink-2)">10</span><span id="ph-val" class="tabular" style="font-size:20px;font-weight:700;color:var(--primary-2);min-width:56px;text-align:right">${(+RESULT.ph).toFixed(1)}</span></div>`;
   s.appendChild(phbar);
-  const sl = phbar.querySelector('#ph-slider'); sl.oninput = () => { phbar.querySelector('#ph-val').textContent = (+sl.value).toFixed(1); };
-  s.appendChild(el('div', 'ac-kpis', kpi(c.mass, 'mass-imbalanced reactions', c.mass ? 'bad' : 'ok') + kpi(c.charge, 'charge-imbalanced reactions', c.charge ? 'warn' : 'ok')));
-  const mc = el('div', 'ac-card'); mc.appendChild(el('h3', '', 'Mass imbalance')); mc.appendChild(el('div', 'sub', 'Elements do not conserve across the reaction (using model or BiGG formulas).'));
-  issueList(mc, RESULT.massIss, 'Every reaction with known formulas conserves mass.'); s.appendChild(mc);
-  const cc = el('div', 'ac-card'); cc.appendChild(el('h3', '', 'Charge imbalance')); cc.appendChild(el('div', 'sub', 'Net charge is non-zero — usually a missing proton at this pH.'));
-  issueList(cc, RESULT.chargeIss, 'Charge conserves across every reaction with known charges.'); s.appendChild(cc);
-  navCount('charge', c.mass + c.charge, (c.mass) ? 'bad' : (c.charge ? 'warn' : 'ok'));
+  const body = el('div', ''); s.appendChild(body);
+  const draw = () => {
+    body.innerHTML = ''; const cc0 = RESULT.counts;
+    body.appendChild(el('div', 'ac-kpis', kpi(cc0.mass, 'mass-imbalanced reactions', cc0.mass ? 'bad' : 'ok') + kpi(cc0.charge, 'charge-imbalanced reactions', cc0.charge ? 'warn' : 'ok') + kpi((+RESULT.ph).toFixed(1), 'simulation pH', 'info')));
+    const mc = el('div', 'ac-card'); mc.appendChild(el('h3', '', 'Mass imbalance')); mc.appendChild(el('div', 'sub', 'Elements do not conserve across the reaction (using model or BiGG formulas). pH-independent.'));
+    issueList(mc, RESULT.massIss, 'Every reaction with known formulas conserves mass.'); body.appendChild(mc);
+    const cc = el('div', 'ac-card'); cc.appendChild(el('h3', '', 'Charge imbalance')); cc.appendChild(el('div', 'sub', `Net charge is non-zero at pH ${(+RESULT.ph).toFixed(1)} — usually a missing proton.`));
+    issueList(cc, RESULT.chargeIss, 'Charge conserves across every reaction with known charges at this pH.'); body.appendChild(cc);
+    navCount('charge', cc0.mass + cc0.charge, cc0.mass ? 'bad' : (cc0.charge ? 'warn' : 'ok'));
+  };
+  const recompute = (pH) => {
+    const { massIss, chargeIss } = computeMassCharge(MODEL, pH);
+    RESULT.massIss = massIss; RESULT.chargeIss = chargeIss; RESULT.ph = pH;
+    RESULT.counts.mass = massIss.length; RESULT.counts.charge = chargeIss.length;
+    draw();
+  };
+  const sl = phbar.querySelector('#ph-slider'); let t = null;
+  sl.oninput = () => { phbar.querySelector('#ph-val').textContent = (+sl.value).toFixed(1); clearTimeout(t); t = setTimeout(() => recompute(+sl.value), 120); };
+  draw();
+  return;
 }
 function roadmap(stage, title, items) {
   const s = $('stage-' + stage); s.innerHTML = '';
@@ -431,9 +481,40 @@ function renderThermo() {
   bc.appendChild(el('div', 'sub', 'Reactions that cannot carry flux in any feasible state (FVA min = max = 0) — usually caused by a dead-end metabolite or a gap. Approve to flag for gap-filling / removal.'));
   const bIss = blocked.map(id => { const r = MODEL.rxns.find(x => x.id === id); return { id: 'blk_' + id, sev: 'warn', title: `Blocked reaction <code>${esc(id)}</code>`, note: (r && r.name && r.name !== id ? esc(r.name) + ' — ' : '') + 'cannot carry flux; likely a gap or a dead-end substrate.', apply: { flag: id } }; });
   issueList(bc, bIss, 'No blocked reactions — every reaction can carry flux somewhere in the solution space.'); s.appendChild(bc);
-  const dir = el('div', 'ac-roadmap'); dir.innerHTML = `<h3>Reaction directionality <span class="tag">ΔG dataset — v2</span></h3><p style="font-size:12.8px;color:var(--ink-2);margin:6px 0 0">Next: reconcile each reaction's reversibility with ΔG°′ (component-contribution / eQuilibrator) and a consensus of KEGG · MetaCyc · ModelSEED · Rhea, then re-set bounds. Bundling the ΔG reference is the remaining step.</p>`;
-  s.appendChild(dir);
-  navCount('thermo', blocked.length + (egc.egc ? egc.carriers.length : 0), (egc.egc || blocked.length) ? 'warn' : 'ok');
+  const dirIss = directionalityIssues(MODEL);
+  const dc = el('div', 'ac-card'); dc.appendChild(el('h3', '', 'Reaction directionality (ΔG consensus)'));
+  dc.appendChild(el('div', 'sub', `Bounds are reconciled with ModelSEED's thermodynamic reversibility (a group-contribution + eQuilibrator consensus) and its Δ<sub>r</sub>G′<sup>m</sup>. ${fmt(RESULT.thermo.dirScanned)} of ${fmt(MODEL.rxns.filter(r=>!isExchange(r)).length)} internal reactions carry ΔG data. Only the actionable case is flagged below — the model allows both directions but ΔG makes the reaction one-way. A further <b>${fmt(RESULT.thermo.dirStricter)}</b> reaction${RESULT.thermo.dirStricter===1?' is':'s are'} more restrictive than ModelSEED's default reversibility, which is usually intentional curation and left as-is.`));
+  issueList(dc, dirIss, 'No reaction is more permissive than its ΔG allows — every reversible reaction is thermodynamically bidirectional.'); s.appendChild(dc);
+  navCount('thermo', blocked.length + (egc.egc ? egc.carriers.length : 0) + dirIss.length, (egc.egc || blocked.length || dirIss.length) ? 'warn' : 'ok');
+}
+/* directionality: compare model bounds to ModelSEED thermodynamic reversibility + ΔrG'm.
+   Orientation-independent (compares the reversible/irreversible CLASS, not the sign).
+   Only the high-confidence, actionable direction is flagged: the model allows both ways but
+   ΔG makes the reaction effectively one-way (an infeasible-cycle risk). The opposite case —
+   the model is stricter than ModelSEED's permissive default — is usually intentional curation,
+   so it is reported as a count, not flagged. */
+function directionalityIssues(model) {
+  const T = REF.thermo; if (!T) { RESULT.thermo.dirScanned = 0; RESULT.thermo.dirStricter = 0; return []; }
+  const out = []; let scanned = 0, stricter = 0;
+  model.rxns.forEach(r => {
+    if (isExchange(r) || isBiomass(r)) return;
+    const canon = canonRxn(r); if (!canon) return;
+    const t = T['bigg:' + canon.bigg]; if (!t) return;
+    scanned++;
+    const lb = r.lb == null ? -1000 : r.lb, ub = r.ub == null ? 1000 : r.ub;
+    const modelReversible = lb < -1e-9 && ub > 1e-9;
+    const dgTxt = t.dg != null ? ` Δ<sub>r</sub>G′<sup>m</sup> = ${t.dg > 0 ? '+' : ''}${t.dg}${t.dge != null ? ' ± ' + t.dge : ''} kJ/mol.` : '';
+    const nm = r.name && r.name !== r.id ? esc(r.name) + ' — ' : '';
+    const confIrrev = t.dg != null && Math.abs(t.dg) > 2 * (t.dge || 2) + 10;   // |ΔG| well outside uncertainty & sizeable
+    if ((t.rev === '>' || t.rev === '<') && confIrrev && modelReversible) {
+      out.push({ id: 'dir_' + r.id, sev: 'warn', title: `<code>${esc(r.id)}</code> is reversible but ΔG makes it one-way`,
+        note: nm + `The model allows both directions (bounds ${(+lb)}…${(+ub)}), yet ModelSEED and its Δ<sub>r</sub>G make this reaction effectively irreversible — a route to infeasible cycles.${dgTxt} Constrain the uphill direction to 0 (verify the reaction's orientation first).`, apply: { flag: r.id } });
+    } else if (t.rev === '=' && !modelReversible) {
+      stricter++;
+    }
+  });
+  RESULT.thermo.dirScanned = scanned; RESULT.thermo.dirStricter = stricter;
+  return out;
 }
 function renderValidate() { roadmap('validate', 'Lab validation', [
   '<b>Strain match</b> — type your strain; we fuzzy-match it against <b>GrowthDB</b> (typo-tolerant, with close hits shown) and import its measured growth / uptake / secretion rates.',
