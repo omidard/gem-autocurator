@@ -1,4 +1,5 @@
 /* GEM Autocurator — client-side curation engine. Everything runs in the browser. */
+import GLPK from './vendor/glpk.esm.js';
 const $ = (id) => document.getElementById(id);
 const el = (t, c, h) => { const e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; };
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -10,6 +11,7 @@ let REF = null;        // {met, rxn, props}
 let MODEL = null;      // parsed model
 let RESULT = null;     // curation result {ids, discrep, structure, charge}
 const APPROVED = {};   // issueId -> true/false (undefined = pending)
+try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, applyApproved }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
 async function loadRef() {
@@ -141,6 +143,67 @@ const EXRE = /^(EX_|DM_|SK_|sink_|R_EX_|demand)/i;
 function isExchange(r) { return EXRE.test(r.id) || Object.keys(r.s).length === 1; }
 function isBiomass(r) { return /biomass|_bio\b|^BIO_|objective/i.test(r.id) || /biomass/i.test(r.name || ''); }
 
+/* ---------------- LP layer (GLPK-WASM) ---------------- */
+let _glpk = null;
+async function glpk() { if (!_glpk) _glpk = await GLPK(); return _glpk; }
+function buildLP(g, model, ov, extra) {
+  const rows = {}; model.mets.forEach(m => { rows[m.id] = { name: m.id, vars: [], bnds: { type: g.GLP_FX, lb: 0, ub: 0 } }; });
+  const bounds = [];
+  model.rxns.forEach(r => {
+    let lb = r.lb == null ? -1000 : r.lb, ub = r.ub == null ? 1000 : r.ub;
+    if (ov && ov[r.id]) { if (ov[r.id].lb != null) lb = ov[r.id].lb; if (ov[r.id].ub != null) ub = ov[r.id].ub; }
+    let type = g.GLP_DB; if (lb === ub) type = g.GLP_FX; else if (lb <= -1e30 && ub >= 1e30) type = g.GLP_FR; else if (lb <= -1e30) type = g.GLP_UP; else if (ub >= 1e30) type = g.GLP_LO;
+    bounds.push({ name: r.id, type, lb, ub });
+    Object.entries(r.s).forEach(([mid, c]) => { if (rows[mid]) rows[mid].vars.push({ name: r.id, coef: c }); });
+  });
+  if (extra) extra.forEach(e => { bounds.push({ name: e.id, type: g.GLP_DB, lb: e.lb, ub: e.ub }); Object.entries(e.s).forEach(([mid, c]) => { if (rows[mid]) rows[mid].vars.push({ name: e.id, coef: c }); }); });
+  const subjectTo = Object.values(rows).filter(rw => rw.vars.length).map(rw => ({ name: rw.name, vars: rw.vars, bnds: rw.bnds }));
+  return { name: 'lp', objective: { direction: g.GLP_MAX, name: 'z', vars: [] }, subjectTo, bounds };
+}
+async function optOf(g, lp, rid, dir) { lp.objective = { direction: dir, name: 'z', vars: [{ name: rid, coef: 1 }] }; const r = await g.solve(lp, { msglev: g.GLP_MSG_OFF, presol: true }); return (r.result && r.result.z) || 0; }
+async function blockedReactions(model, onProg) {
+  const g = await glpk(); const lp = buildLP(g, model);
+  const internal = model.rxns.filter(r => !isExchange(r));
+  const blocked = []; let i = 0;
+  for (const r of internal) {
+    const mx = await optOf(g, lp, r.id, g.GLP_MAX); const mn = await optOf(g, lp, r.id, g.GLP_MIN);
+    if (Math.abs(mx) < 1e-7 && Math.abs(mn) < 1e-7) blocked.push(r.id);
+    if (onProg && (++i % 20 === 0 || i === internal.length)) { onProg(i, internal.length); await new Promise(z => setTimeout(z, 0)); }
+  }
+  return blocked;
+}
+async function detectEGC(model) {
+  const g = await glpk();
+  const idOf = (bigg) => { const m = model.mets.find(x => x.id === bigg + '_c' || x.id === bigg || (x.canon && x.canon.bigg === bigg && x.compartment === 'c')); return m ? m.id : null; };
+  const atp = idOf('atp'), adp = idOf('adp'), pi = idOf('pi'), h = idOf('h'), h2o = idOf('h2o');
+  if (!atp || !adp || !pi) return { tested: false, reason: 'no cytosolic ATP/ADP/Pi found' };
+  const ov = {}; model.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0 }; });   // close all uptake
+  const s = {}; s[atp] = -1; if (h2o) s[h2o] = -1; s[adp] = 1; s[pi] = 1; if (h) s[h] = 1;
+  const lp = buildLP(g, model, ov, [{ id: '__EGC_ATP__', s, lb: 0, ub: 1000 }]);
+  lp.objective = { direction: g.GLP_MAX, name: 'z', vars: [{ name: '__EGC_ATP__', coef: 1 }] };
+  const r = await g.solve(lp, { msglev: g.GLP_MSG_OFF, presol: true });
+  const val = (r.result && r.result.z) || 0;
+  const carriers = val > 1e-6 && r.result.vars ? Object.entries(r.result.vars).filter(([k, v]) => k !== '__EGC_ATP__' && Math.abs(v) > 1e-6).map(([k, v]) => ({ id: k, flux: +v.toFixed(2) })).sort((a, b) => Math.abs(b.flux) - Math.abs(a.flux)).slice(0, 40) : [];
+  return { tested: true, egc: val > 1e-6, atpFlux: +val.toFixed(2), carriers };
+}
+/* proton/water balancing: can the reaction be balanced by adding x H+ and y H2O? returns fix or null */
+function protonWaterFix(bal, cbal) {
+  const H = bal.H || 0, O = bal.O || 0;                 // products - reactants imbalance
+  const x = -(cbal || 0) || 0;                           // protons to add to products (H+ charge +1)
+  const y = -O || 0;                                     // waters to add to products (normalise -0)
+  const others = Object.entries(bal).filter(([e, v]) => e !== 'H' && e !== 'O' && Math.abs(v) > 1e-6);
+  if (others.length) return null;                        // non-H/O imbalance -> manual
+  if (Math.abs(H + x + 2 * y) > 1e-6) return null;       // protons+water can't reconcile H -> manual
+  if (!x && !y) return null;
+  return { h: x, h2o: y };                               // add x H+ (+ y H2O) to product side (neg = reactant side)
+}
+function fixStr(fix, comp) {
+  const parts = [];
+  if (fix.h) parts.push(`${Math.abs(fix.h)} H⁺ (<code>h_${comp}</code>) to the ${fix.h > 0 ? 'product' : 'reactant'} side`);
+  if (fix.h2o) parts.push(`${Math.abs(fix.h2o)} H₂O (<code>h2o_${comp}</code>) to the ${fix.h2o > 0 ? 'product' : 'reactant'} side`);
+  return parts.join(' and ');
+}
+
 function curate(model) {
   // --- identifiers ---
   let mBigg = 0, mLike = 0, mUn = 0;
@@ -188,14 +251,24 @@ function curate(model) {
   const byId = {}; model.mets.forEach(m => { byId[m.id] = m; });
   const F = (mid) => { const m = byId[mid]; let f = (m && m.formula) || ''; if (!f && m && m.canon && REF.props[m.canon.bigg]) f = REF.props[m.canon.bigg].f; return parseFormula(f); };
   const CH = (mid) => { const m = byId[mid]; if (m && m.charge != null) return m.charge; if (m && m.canon && REF.props[m.canon.bigg] && REF.props[m.canon.bigg].c != null) return REF.props[m.canon.bigg].c; return null; };
+  const compById = {}; model.mets.forEach(m => { compById[m.id] = m.compartment; });
+  const hIn = {}, h2oIn = {}; model.mets.forEach(m => { const b = m.canon ? m.canon.bigg : baseId(m.id); if (b === 'h') hIn[m.compartment] = m.id; if (b === 'h2o') h2oIn[m.compartment] = m.id; });
   model.rxns.forEach(r => { if (isExchange(r) || isBiomass(r)) return;
     const bal = {}; let known = true;
     Object.entries(r.s).forEach(([mid, c]) => { const f = F(mid); if (!f || !Object.keys(f).length) known = false; Object.entries(f).forEach(([e, n]) => bal[e] = (bal[e] || 0) + c * n); });
-    if (known) { const off = Object.entries(bal).filter(([e, v]) => Math.abs(v) > 1e-6); if (off.length) massIss.push({ id: 'mass_' + r.id, cat: 'charge', sub: 'mass', sev: 'bad', kind: 'mass',
-      title: `Mass imbalance in <code>${esc(r.id)}</code>`, note: 'unbalanced elements: ' + off.map(([e, v]) => `${e}${v > 0 ? '+' : ''}${(+v.toFixed(2))}`).join(', '), apply: { flag: r.id } }); }
     let cbal = 0, ck = true; Object.entries(r.s).forEach(([mid, c]) => { const q = CH(mid); if (q == null) ck = false; else cbal += c * q; });
-    if (ck && Math.abs(cbal) > 1e-6) chargeIss.push({ id: 'chg_' + r.id, cat: 'charge', sub: 'charge', sev: 'warn', kind: 'charge',
-      title: `Charge imbalance in <code>${esc(r.id)}</code>`, note: `net charge ${cbal > 0 ? '+' : ''}${(+cbal.toFixed(2))} — often a missing/extra proton at the simulation pH.`, apply: { flag: r.id } });
+    const massOff = known ? Object.entries(bal).filter(([e, v]) => Math.abs(v) > 1e-6) : [];
+    const chgOff = ck && Math.abs(cbal) > 1e-6;
+    if (!massOff.length && !chgOff) return;
+    const comp = compById[Object.keys(r.s)[0]] || 'c';
+    const fix = (known && ck) ? protonWaterFix(bal, cbal) : null;
+    const canApply = fix && (!fix.h || hIn[comp]) && (!fix.h2o || h2oIn[comp]);
+    const fixTxt = fix ? (canApply ? ` — <b>fix:</b> add ${fixStr(fix, comp)}` : ' — a proton/water fix balances it, but the model lacks h/h2o in this compartment') : ' — not a proton/water imbalance; needs manual curation';
+    const applyObj = canApply ? { rxn: r.id, proton: fix, h: hIn[comp], h2o: h2oIn[comp] } : null;
+    if (massOff.length) massIss.push({ id: 'mass_' + r.id, cat: 'charge', sub: 'mass', sev: 'bad', kind: 'mass',
+      title: `Mass imbalance in <code>${esc(r.id)}</code>`, note: 'unbalanced: ' + massOff.map(([e, v]) => `${e}${v > 0 ? '+' : ''}${(+v.toFixed(2))}`).join(', ') + fixTxt, apply: applyObj });
+    else chargeIss.push({ id: 'chg_' + r.id, cat: 'charge', sub: 'charge', sev: 'warn', kind: 'charge',
+      title: `Charge imbalance in <code>${esc(r.id)}</code>`, note: `net charge ${cbal > 0 ? '+' : ''}${(+cbal.toFixed(2))}` + fixTxt, apply: applyObj });
   });
 
   return { idIssues, discrep, structure, orphan, massIss, chargeIss,
@@ -253,12 +326,35 @@ function issueList(container, issues, emptyMsg) {
   const list = el('div', 'ac-issues'); issues.forEach(i => list.appendChild(issueRow(i))); container.appendChild(list);
 }
 function kpi(v, l, cls) { return `<div class="ac-kpi ${cls || ''}"><div class="bar"></div><div class="v tabular">${fmt(v)}</div><div class="l">${esc(l)}</div></div>`; }
+function drawVizIds(c) {
+  if (!window.Plotly) return;
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const ink = dark ? '#C2CFE0' : '#334155';
+  const base = { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { family: 'Fira Sans, sans-serif', size: 11, color: ink }, margin: { l: 8, r: 8, t: 26, b: 8 } };
+  const cfg = { responsive: true, displayModeBar: false };
+  const donut = (id, title, vals) => window.Plotly.newPlot(id, [{ type: 'pie', hole: .62, labels: ['BiGG', 'BiGG-like', 'unmapped'], values: vals, marker: { colors: ['#15803D', '#2563EB', '#B45309'] }, textinfo: 'percent', textfont: { size: 10 }, hovertemplate: '%{label}: %{value}<extra></extra>', sort: false }], Object.assign({}, base, { title: { text: title, font: { size: 12 } }, showlegend: false, annotations: [{ text: fmt(vals[0] + vals[1] + vals[2]), x: .5, y: .5, showarrow: false, font: { size: 15, color: ink } }] }), cfg);
+  donut('viz-met', 'Metabolite ids', [c.mBigg, c.mLike, c.mUn]);
+  donut('viz-rxn', 'Reaction ids', [c.rBigg, c.rLike, c.rUn]);
+  const labels = ['Renames', 'Dup metabolites', 'Dup reactions', 'Dead-ends', 'Mass imbalance', 'Charge imbalance'];
+  const vals = [RESULT.idIssues.length, c.dupMet, c.dupRxn, c.dead, c.mass, c.charge];
+  const cols = ['#2563EB', '#DC2626', '#DC2626', '#B45309', '#DC2626', '#B45309'];
+  window.Plotly.newPlot('viz-iss', [{ type: 'bar', orientation: 'h', y: labels.slice().reverse(), x: vals.slice().reverse(), marker: { color: cols.slice().reverse() }, text: vals.slice().reverse().map(v => v || ''), textposition: 'outside', textfont: { size: 10 }, hovertemplate: '%{y}: %{x}<extra></extra>' }], Object.assign({}, base, { title: { text: 'Findings', font: { size: 12 } }, margin: { l: 110, r: 24, t: 26, b: 24 }, xaxis: { gridcolor: dark ? 'rgba(255,255,255,.08)' : '#EEF2F8', zeroline: false }, yaxis: { tickfont: { size: 10 } } }), cfg);
+}
 
 function renderIds() {
   const s = $('stage-ids'); s.innerHTML = ''; const c = RESULT.counts;
   s.appendChild(el('div', 'ac-sh', `<h2>Identifier mapping</h2><p>Every metabolite and reaction identifier is resolved against <b>BiGG</b> — and, when a compound or reaction exists only in KEGG / ModelSEED / MetaNetX / ChEBI / RHEA, a deterministic <b>BiGG-like</b> id so your model stays internally consistent and portable.</p>`));
   s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mUn, 'metabolites unmapped', c.mUn ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rUn, 'reactions unmapped', c.rUn ? 'warn' : 'ok')));
   const pct = Math.round(100 * (c.mBigg + c.mLike) / Math.max(1, c.mets));
+  // --- dashboard visualisation: coverage donuts + issue overview ---
+  const viz = el('div', 'ac-card'); viz.appendChild(el('h3', '', 'Curation overview'));
+  viz.appendChild(el('div', 'sub', 'Reference coverage and every finding across the pipeline, at a glance.'));
+  const grid = el('div', ''); grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:14px';
+  const d1 = el('div', 'ac-plot'); d1.id = 'viz-met'; d1.style.height = '210px';
+  const d2 = el('div', 'ac-plot'); d2.id = 'viz-rxn'; d2.style.height = '210px';
+  const d3 = el('div', 'ac-plot'); d3.id = 'viz-iss'; d3.style.height = '210px';
+  grid.append(d1, d2, d3); viz.appendChild(grid); s.appendChild(viz);
+  setTimeout(() => drawVizIds(c), 30);
   const card = el('div', 'ac-card'); card.appendChild(el('h3', '', 'Proposed identifier renames'));
   card.appendChild(el('div', 'sub', 'Approve to rename in the exported model; reject to keep the original id. Exchange/demand reactions are left as-is.'));
   issueList(card, RESULT.idIssues, 'Every identifier already matches its canonical form. Nothing to rename.');
@@ -308,10 +404,37 @@ function roadmap(stage, title, items) {
   const r = el('div', 'ac-roadmap'); r.innerHTML = `<h3>${esc(title)} <span class="tag">v2 — engine wiring in progress</span></h3><p style="font-size:13px;color:var(--ink-2);margin:6px 0 0">This stage uses the in-browser LP solver and our GrowthDB / MediaDB resources. The reference data and algorithm are specified; the interactive panel lands next.</p><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
   s.appendChild(r);
 }
-function renderThermo() { roadmap('thermo', 'Thermodynamics & cycles', [
-  '<b>Blocked reactions</b> — FVA via the bundled GLPK-WASM solver: reactions that cannot carry flux in any state.',
-  '<b>Energy-generating cycles (EGCs)</b> — maximise ATP hydrolysis with all uptake closed; any positive solution is an infeasible free-energy loop to break.',
-  '<b>Directionality</b> — ΔG°′ (component-contribution / eQuilibrator) reconciled with a consensus of KEGG, MetaCyc, ModelSEED and Rhea directionality, then bounds are re-set.']); navCount('thermo', '—', 'info'); }
+function renderThermo() {
+  const s = $('stage-thermo'); s.innerHTML = '';
+  s.appendChild(el('div', 'ac-sh', `<h2>Thermodynamics &amp; cycles</h2><p>Flux-based checks solved live with the bundled GLPK-WASM LP solver: reactions that can never carry flux, and thermodynamically infeasible energy-generating cycles that let the model make ATP from nothing.</p>`));
+  if (!RESULT.thermo) {
+    const internal = MODEL.rxns.filter(r => !isExchange(r)).length;
+    const run = el('div', 'ac-card');
+    run.innerHTML = `<h3>Run the flux scan</h3><div class="sub">Energy-generating-cycle detection is one LP; blocked-reaction detection runs flux-variability over all ${fmt(internal)} internal reactions (${fmt(internal * 2)} LPs)${internal > 700 ? ' — this may take up to a minute on a large model' : ''}.</div>`;
+    const btn = el('button', 'ac-btn primary', '∮ Run thermodynamic scan'); const prog = el('div', '', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2);margin-top:10px';
+    btn.onclick = async () => { btn.disabled = true; btn.textContent = 'Solving…';
+      const egc = await detectEGC(MODEL); prog.textContent = 'Energy-generating cycles checked. Scanning for blocked reactions…';
+      const blocked = await blockedReactions(MODEL, (i, n) => { prog.innerHTML = `Blocked-reaction FVA: <b>${i}/${n}</b> reactions…`; });
+      RESULT.thermo = { egc, blocked }; renderThermo(); };
+    run.append(btn, prog); s.appendChild(run); navCount('thermo', '?', 'info'); return;
+  }
+  const { egc, blocked } = RESULT.thermo;
+  s.appendChild(el('div', 'ac-kpis', kpi(blocked.length, 'blocked reactions', blocked.length ? 'warn' : 'ok') + kpi(egc.tested ? (egc.egc ? egc.atpFlux : 0) : '—', 'ATP from nothing (EGC flux)', egc.egc ? 'bad' : 'ok') + kpi(egc.tested && egc.egc ? egc.carriers.length : 0, 'reactions in the EGC loop', egc.egc ? 'bad' : 'ok')));
+  const ec = el('div', 'ac-card'); ec.appendChild(el('h3', '', 'Energy-generating cycle (EGC)'));
+  ec.appendChild(el('div', 'sub', 'All uptake is closed and ATP hydrolysis is maximised. Any positive flux means the network can make ATP from nothing — a thermodynamically infeasible loop.'));
+  if (!egc.tested) ec.appendChild(el('div', 'ac-empty', 'ATP/ADP/Pi not found in the cytosol — EGC test skipped.'));
+  else if (!egc.egc) ec.appendChild(el('div', 'ac-empty', '<span class="big">✓</span>No energy-generating cycle — the model cannot make ATP without an energy source.'));
+  else { ec.appendChild(el('div', 'ac-interp', `<b>Infeasible cycle found.</b> The model produces <b>${egc.atpFlux}</b> units of ATP with no substrate uptake, carried by ${egc.carriers.length} reactions. Constrain the directionality of one of these to break it:`));
+    const list = el('div', 'ac-issues'); egc.carriers.forEach(cw => { const r = MODEL.rxns.find(x => x.id === cw.id); list.appendChild(issueRow({ id: 'egc_' + cw.id, sev: 'bad', title: `<code>${esc(cw.id)}</code> carries flux ${cw.flux}`, note: (r && r.name && r.name !== cw.id ? esc(r.name) + ' — ' : '') + 'candidate to make irreversible (constrain lb or ub to 0).', apply: { flag: cw.id } })); }); ec.appendChild(list); }
+  s.appendChild(ec);
+  const bc = el('div', 'ac-card'); bc.appendChild(el('h3', '', 'Blocked reactions'));
+  bc.appendChild(el('div', 'sub', 'Reactions that cannot carry flux in any feasible state (FVA min = max = 0) — usually caused by a dead-end metabolite or a gap. Approve to flag for gap-filling / removal.'));
+  const bIss = blocked.map(id => { const r = MODEL.rxns.find(x => x.id === id); return { id: 'blk_' + id, sev: 'warn', title: `Blocked reaction <code>${esc(id)}</code>`, note: (r && r.name && r.name !== id ? esc(r.name) + ' — ' : '') + 'cannot carry flux; likely a gap or a dead-end substrate.', apply: { flag: id } }; });
+  issueList(bc, bIss, 'No blocked reactions — every reaction can carry flux somewhere in the solution space.'); s.appendChild(bc);
+  const dir = el('div', 'ac-roadmap'); dir.innerHTML = `<h3>Reaction directionality <span class="tag">ΔG dataset — v2</span></h3><p style="font-size:12.8px;color:var(--ink-2);margin:6px 0 0">Next: reconcile each reaction's reversibility with ΔG°′ (component-contribution / eQuilibrator) and a consensus of KEGG · MetaCyc · ModelSEED · Rhea, then re-set bounds. Bundling the ΔG reference is the remaining step.</p>`;
+  s.appendChild(dir);
+  navCount('thermo', blocked.length + (egc.egc ? egc.carriers.length : 0), (egc.egc || blocked.length) ? 'warn' : 'ok');
+}
 function renderValidate() { roadmap('validate', 'Lab validation', [
   '<b>Strain match</b> — type your strain; we fuzzy-match it against <b>GrowthDB</b> (typo-tolerant, with close hits shown) and import its measured growth / uptake / secretion rates.',
   '<b>Media</b> — the exact growth medium of each measurement is resolved from <b>MediaDB</b> (13k media) and bound onto the model.',
@@ -331,7 +454,7 @@ function renderReport() {
   exp.append(
     dl('Curated COBRA JSON', 'cobrapy-ready model', 'JSON', () => download(exportJson(), MODEL.id + '_curated.json', 'application/json')),
     dl('Curated SBML', 'SBML L3 FBC', 'XML', () => download(exportSBML(), MODEL.id + '_curated.xml', 'application/xml')),
-    dl('MATLAB (.mat)', 'COBRA Toolbox — roadmap', 'MAT', () => alert('MAT export (COBRA Toolbox struct) is on the roadmap. JSON and SBML round-trip losslessly today.')),
+    dl('Curated MATLAB (.mat)', 'COBRA Toolbox model struct', 'MAT', () => download(exportMAT(), MODEL.id + '_curated.mat', 'application/octet-stream')),
     dl('Curation report', 'full findings + decisions', 'MD', () => download(exportReport(allIss), MODEL.id + '_curation_report.md', 'text/markdown')),
   );
   card.appendChild(exp); s.appendChild(card);
@@ -341,10 +464,32 @@ function renderReport() {
 /* ---------------- export ---------------- */
 function applyApproved(model) {
   const m = JSON.parse(JSON.stringify({ mets: model.mets.map(x => ({ id: x.id, name: x.name, formula: x.formula, charge: x.charge, compartment: x.compartment })), rxns: model.rxns.map(r => ({ id: r.id, name: r.name, s: r.s, lb: r.lb, ub: r.ub, gpr: r.gpr })), id: model.id, name: model.name, genes: model.genes }));
+  const log = { renames: 0, merges: 0, protons: 0 };
+  const rxnById = {}; m.rxns.forEach(r => { rxnById[r.id] = r; });
+  // 1) proton/water balancing fixes (original ids still intact)
+  [...RESULT.massIss, ...RESULT.chargeIss].forEach(i => { if (APPROVED[i.id] === true && i.apply && i.apply.proton) {
+    const r = rxnById[i.apply.rxn]; if (!r) return; const p = i.apply.proton;
+    if (p.h && i.apply.h) { r.s[i.apply.h] = (r.s[i.apply.h] || 0) + p.h; if (!r.s[i.apply.h]) delete r.s[i.apply.h]; }
+    if (p.h2o && i.apply.h2o) { r.s[i.apply.h2o] = (r.s[i.apply.h2o] || 0) + p.h2o; if (!r.s[i.apply.h2o]) delete r.s[i.apply.h2o]; }
+    log.protons++;
+  } });
+  // 2) metabolite merges (duplicate species -> one canonical id)
+  const metRe = {};
+  RESULT.discrep.filter(d => d.kind === 'dupmet').forEach(d => { if (APPROVED[d.id] !== true) return; d.apply.merge.forEach(mid => metRe[mid] = d.apply.into); log.merges++; });
+  if (Object.keys(metRe).length) {
+    const seen = new Set(); m.mets = m.mets.filter(x => { const nid = metRe[x.id] || x.id; if (seen.has(nid)) return false; seen.add(nid); x.id = nid; return true; });
+    m.rxns.forEach(r => { const ns = {}; Object.entries(r.s).forEach(([mid, c]) => { const nid = metRe[mid] || mid; ns[nid] = (ns[nid] || 0) + c; }); r.s = ns; });
+  }
+  // 3) reaction merges (keep first, drop the rest)
+  const drop = new Set();
+  RESULT.discrep.filter(d => d.kind === 'duprxn').forEach(d => { if (APPROVED[d.id] !== true) return; d.apply.mergeRxn.slice(1).forEach(rid => drop.add(rid)); log.merges++; });
+  if (drop.size) m.rxns = m.rxns.filter(r => !drop.has(r.id));
+  // 4) identifier renames
   const ren = {};
-  [...RESULT.idIssues].forEach(i => { if (APPROVED[i.id] === true && i.apply) { if (i.apply.met) ren['m:' + i.apply.met] = i.apply.newId; if (i.apply.rxn) ren['r:' + i.apply.rxn] = i.apply.newId; } });
-  m.mets.forEach(x => { const n = ren['m:' + x.id]; if (n) x.id = n; });
+  RESULT.idIssues.forEach(i => { if (APPROVED[i.id] === true && i.apply) { if (i.apply.met && !metRe[i.apply.met]) ren['m:' + i.apply.met] = i.apply.newId; if (i.apply.rxn && !drop.has(i.apply.rxn)) ren['r:' + i.apply.rxn] = i.apply.newId; log.renames++; } });
+  const seenM = new Set(); m.mets = m.mets.filter(x => { const n = ren['m:' + x.id] || x.id; if (seenM.has(n)) return false; seenM.add(n); x.id = n; return true; });
   m.rxns.forEach(r => { const n = ren['r:' + r.id]; if (n) r.id = n; const ns = {}; Object.entries(r.s).forEach(([mid, c]) => { ns[ren['m:' + mid] || mid] = c; }); r.s = ns; });
+  m._log = log;
   return m;
 }
 function exportJson() {
@@ -371,7 +516,42 @@ function exportReport(allIss) {
   const sect = (name, arr) => { if (!arr.length) return `\n## ${name}\n\n_none_\n`; return `\n## ${name} (${arr.length})\n\n` + arr.map(i => `- [${APPROVED[i.id] === true ? 'x' : ' '}] **${i.title.replace(/<[^>]+>/g, '')}** — ${(i.note || '').replace(/<[^>]+>/g, '')}${i.from ? ` (\`${i.from}\` → \`${i.to}\`)` : ''}`).join('\n') + '\n'; };
   return `# GEM Autocuration report — ${MODEL.name}\n\nGenerated ${d} · ${MODEL.format} · ${c.mets} metabolites · ${c.rxns} reactions · ${c.genes} genes\n\n## Summary\n\n| Check | Finding |\n|---|---|\n| Metabolites → BiGG / BiGG-like / unmapped | ${c.mBigg} / ${c.mLike} / ${c.mUn} |\n| Reactions → BiGG / BiGG-like / unmapped | ${c.rBigg} / ${c.rLike} / ${c.rUn} |\n| Duplicate metabolites / reactions | ${c.dupMet} / ${c.dupRxn} |\n| Dead-end metabolites | ${c.dead} |\n| Mass-imbalanced reactions | ${c.mass} |\n| Charge-imbalanced reactions | ${c.charge} |\n| Findings approved / rejected / pending | ${allIss.filter(i => APPROVED[i.id] === true).length} / ${allIss.filter(i => APPROVED[i.id] === false).length} / ${allIss.filter(i => APPROVED[i.id] == null).length} |\n${sect('Identifier renames', RESULT.idIssues)}${sect('Discrepancies (duplicates)', RESULT.discrep)}${sect('Dead-end metabolites', RESULT.structure)}${sect('Mass imbalance', RESULT.massIss)}${sect('Charge imbalance', RESULT.chargeIss)}\n---\nCurated with the GEM Autocurator against BiGG + KEGG + ModelSEED + MetaNetX + ChEBI + RHEA.\n`;
 }
-function download(content, name, type) { const b = new Blob([content], { type }); const u = URL.createObjectURL(b); const a = el('a'); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 2000); }
+function download(content, name, type) { const b = content instanceof Blob ? content : new Blob([content], { type }); const u = URL.createObjectURL(b); const a = el('a'); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 2000); }
+
+/* ---- MATLAB v5 (.mat) COBRA-model writer ---- */
+function _cat(...a) { let n = 0; a.forEach(x => n += x.length); const o = new Uint8Array(n); let p = 0; a.forEach(x => { o.set(x, p); p += x.length; }); return o; }
+function _pad8(a) { const r = a.length % 8; return r ? _cat(a, new Uint8Array(8 - r)) : a; }
+function _tag(type, n) { const b = new Uint8Array(8); const d = new DataView(b.buffer); d.setUint32(0, type, true); d.setUint32(4, n, true); return b; }
+function _elem(type, data) { return _cat(_tag(type, data.length), _pad8(data)); }
+function _i32(nums) { const b = new Uint8Array(nums.length * 4); const d = new DataView(b.buffer); nums.forEach((n, i) => d.setInt32(i * 4, n, true)); return b; }
+function _dbl(nums) { const b = new Uint8Array(nums.length * 8); const d = new DataView(b.buffer); nums.forEach((n, i) => d.setFloat64(i * 8, n, true)); return b; }
+function _str(s) { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff; return b; }
+function _u16(codes) { const b = new Uint8Array(codes.length * 2); const d = new DataView(b.buffer); codes.forEach((c, i) => d.setUint16(i * 2, c, true)); return b; }
+function _mx(cls, dims, name, content) { const flags = _elem(6, _i32([cls, 0])); const dim = _elem(5, _i32(dims)); const nm = _elem(1, _str(name)); const body = _cat(flags, dim, nm, content); return _cat(_tag(14, body.length), body); }
+function mDbl(name, arr, rows, cols) { return _mx(6, [rows, cols], name, _elem(9, _dbl(Array.from(arr)))); }
+function mChar(name, str) { return _mx(4, [str ? 1 : 0, str.length], name, _elem(4, _u16(Array.from(str).map(c => c.charCodeAt(0))))); }
+function mCell(name, strs) { const cells = strs.map(s => mChar('', s)); return _mx(1, [strs.length, 1], name, cells.length ? _cat(...cells) : new Uint8Array(0)); }
+function mStruct(name, fields) { const L = 32; const fnLen = _elem(5, _i32([L])); const names = new Uint8Array(fields.length * L); fields.forEach((f, i) => { const nb = _str(f[0]); names.set(nb.subarray(0, L - 1), i * L); }); const namesEl = _elem(1, names); const vals = fields.length ? _cat(...fields.map(f => f[1])) : new Uint8Array(0); return _mx(2, [1, 1], name, _cat(fnLen, namesEl, vals)); }
+function exportMAT() {
+  const m = applyApproved(MODEL);
+  const rxns = m.rxns.map(r => r.id), mets = m.mets.map(x => x.id), metIdx = {}; mets.forEach((id, i) => metIdx[id] = i);
+  const nM = mets.length, nR = rxns.length;
+  const S = new Float64Array(nM * nR); m.rxns.forEach((r, j) => Object.entries(r.s).forEach(([mid, c]) => { const i = metIdx[mid]; if (i != null) S[i + j * nM] = c; }));
+  const fields = [
+    ['rxns', mCell('', rxns)], ['mets', mCell('', mets)], ['S', mDbl('', S, nM, nR)],
+    ['lb', mDbl('', m.rxns.map(r => r.lb == null ? -1000 : r.lb), nR, 1)], ['ub', mDbl('', m.rxns.map(r => r.ub == null ? 1000 : r.ub), nR, 1)],
+    ['c', mDbl('', m.rxns.map(r => (/biomass/i.test(r.id) || /biomass/i.test(r.name || '')) ? 1 : 0), nR, 1)], ['b', mDbl('', mets.map(() => 0), nM, 1)],
+    ['rev', mDbl('', m.rxns.map(r => r.lb < 0 ? 1 : 0), nR, 1)],
+    ['rxnNames', mCell('', m.rxns.map(r => r.name || r.id))], ['metNames', mCell('', m.mets.map(x => x.name || x.id))],
+    ['metFormulas', mCell('', m.mets.map(x => x.formula || ''))], ['grRules', mCell('', m.rxns.map(r => r.gpr || ''))],
+    ['description', mChar('', (m.name || m.id || 'model') + ' — autocurated')],
+  ];
+  const struct = mStruct('model', fields);
+  const head = new Uint8Array(128); const desc = 'MATLAB 5.0 MAT-file, Platform: GEM Autocurator, Created: ' + new Date().toISOString().slice(0, 10);
+  for (let i = 0; i < 116; i++) head[i] = i < desc.length ? desc.charCodeAt(i) : 0x20;
+  new DataView(head.buffer).setUint16(124, 0x0100, true); head[126] = 0x49; head[127] = 0x4D;
+  return new Blob([head, struct], { type: 'application/octet-stream' });
+}
 
 /* ---------------- flow ---------------- */
 async function ingest(text, filename) {
