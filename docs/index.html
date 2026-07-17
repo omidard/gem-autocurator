@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEM Autocurator — drop a genome-scale model, get it curated</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets_studio.css">
+<link rel="stylesheet" href="autocurator.css">
+<script>(function(){var t;try{t=localStorage.getItem('gem-browser-theme');}catch(e){}if(!t)t='dark';document.documentElement.setAttribute('data-theme',t);})();</script>
+</head>
+<body>
+<div class="ac-shell">
+  <!-- ===== RAIL ===== -->
+  <aside class="ac-rail">
+    <div class="ac-brand">
+      <div class="ac-logo"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/><circle cx="12" cy="12" r="3.2"/></svg></div>
+      <div class="ac-tt"><b>GEM Autocurator</b><span>upload → curate → supervise → export</span></div>
+    </div>
+    <nav class="ac-nav" id="ac-nav">
+      <div class="ac-nav-grp"><div class="ac-lbl">Pipeline</div>
+        <button class="ac-nav-item active" data-stage="upload"><span class="ni">⬆</span> Upload model</button>
+        <button class="ac-nav-item" data-stage="ids" disabled><span class="ni">◎</span> Identifier mapping</button>
+        <button class="ac-nav-item" data-stage="discrep" disabled><span class="ni">⇄</span> Discrepancies</button>
+        <button class="ac-nav-item" data-stage="structure" disabled><span class="ni">◇</span> Structural QC</button>
+        <button class="ac-nav-item" data-stage="charge" disabled><span class="ni">±</span> Mass &amp; charge@pH</button>
+        <button class="ac-nav-item" data-stage="thermo" disabled><span class="ni">∮</span> Thermo &amp; cycles</button>
+        <button class="ac-nav-item" data-stage="validate" disabled><span class="ni">✓</span> Lab validation</button>
+      </div>
+      <div class="ac-nav-grp"><div class="ac-lbl">Deliver</div>
+        <button class="ac-nav-item" data-stage="report" disabled><span class="ni">▤</span> Report &amp; export</button>
+      </div>
+    </nav>
+    <div class="ac-rail-foot" id="ac-railfoot">
+      <div class="ac-refline">Curated against <b>BiGG</b> + BiGG-like<br>KEGG · ModelSEED · MetaNetX · ChEBI · RHEA</div>
+    </div>
+  </aside>
+
+  <!-- ===== MAIN ===== -->
+  <main class="ac-main">
+    <header class="ac-top">
+      <div class="ac-crumbs" id="ac-crumbs">Upload model</div>
+      <div class="ac-modelchip" id="ac-modelchip" style="display:none"></div>
+      <button class="theme-toggle" id="ac-theme" type="button" aria-label="theme"><svg class="i-moon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg><svg class="i-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.4M12 19.6V22M2 12h2.4M19.6 12H22M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"/></svg></button>
+    </header>
+
+    <!-- UPLOAD -->
+    <section class="ac-stage active" id="stage-upload">
+      <div class="ac-hero">
+        <h1>Drop a genome-scale model. Get it curated.</h1>
+        <p>Upload an SBML, COBRA-JSON or MATLAB model. The autocurator canonicalises every metabolite and reaction identifier against <b>BiGG</b> (and BiGG-like ids for compounds only KEGG / ModelSEED / MetaNetX carry), flags naming discrepancies, dead-ends, blocked reactions, mass &amp; charge imbalance (at your simulation pH), energy-generating cycles and reaction directionality — then hands you a supervised, downloadable <b>SBML / JSON / MAT</b> plus a full analytical report. Everything runs in your browser; your model never leaves this page.</p>
+      </div>
+      <div class="ac-drop" id="ac-drop">
+        <input type="file" id="ac-file" accept=".xml,.sbml,.json,.mat" hidden>
+        <div class="ac-drop-inner">
+          <svg viewBox="0 0 24 24" width="42" height="42" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+          <div class="ac-drop-t">Drop your model here, or <span>browse</span></div>
+          <div class="ac-drop-s">.xml · .sbml · .json (COBRApy) — up to ~40&nbsp;MB</div>
+        </div>
+      </div>
+      <div class="ac-examples">
+        <span>No model handy?</span>
+        <button class="ac-ex" data-ex="e_coli_core">Load <i>E. coli</i> core (demo)</button>
+      </div>
+      <div class="ac-load" id="ac-load" style="display:none"><div class="ac-spin"></div><span id="ac-load-msg">Loading reference maps…</span></div>
+      <div class="ac-pipeline-preview">
+        <div class="ac-pp-card"><b>1 · Identifiers</b><span>Map every met/rxn id to BiGG or a stable BiGG-like id; catch duplicates &amp; conflicting names.</span></div>
+        <div class="ac-pp-card"><b>2 · Structure</b><span>Dead-end metabolites, blocked reactions, orphan &amp; mass-imbalanced reactions.</span></div>
+        <div class="ac-pp-card"><b>3 · Charge @ pH</b><span>Set your simulation pH; charges are recomputed and charge balance is curated.</span></div>
+        <div class="ac-pp-card"><b>4 · Thermo</b><span>ΔG-consensus directionality + energy-generating-cycle detection.</span></div>
+        <div class="ac-pp-card"><b>5 · Validation</b><span>Match your strain in GrowthDB, simulate on the right medium, compare to lab data.</span></div>
+        <div class="ac-pp-card"><b>6 · Supervise</b><span>Approve or reject each fix; export the model you signed off on.</span></div>
+      </div>
+    </section>
+
+    <section class="ac-stage" id="stage-ids"></section>
+    <section class="ac-stage" id="stage-discrep"></section>
+    <section class="ac-stage" id="stage-structure"></section>
+    <section class="ac-stage" id="stage-charge"></section>
+    <section class="ac-stage" id="stage-thermo"></section>
+    <section class="ac-stage" id="stage-validate"></section>
+    <section class="ac-stage" id="stage-report"></section>
+  </main>
+</div>
+<footer class="ac-footer">GEM Autocurator · <a href="https://github.com/omidard/gem-autocurator" target="_blank" rel="noopener">source</a> · curation reference: BiGG + KEGG + ModelSEED + MetaNetX + ChEBI + RHEA · all computation is client-side</footer>
+<script type="module" src="autocurator.js"></script>
+</body>
+</html>
