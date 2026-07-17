@@ -141,6 +141,42 @@ function canonRxn(r) {
   if (!hit) for (const [ns, v] of Object.entries(r.anno || {})) { hit = R[ns + ':' + v]; if (hit) break; }
   return hit || null;
 }
+
+/* ---------------- robust BiGG-like id synthesis ----------------
+   For metabolites/reactions absent from BiGG and our cross-ref tables, mint a
+   deterministic, readable, BiGG-styled id from the name, following BiGG conventions
+   (lowercase compound slugs, greek→latin, drop stereodescriptors, compartment suffix).
+   Uniqueness is enforced against real BiGG ids and across generated ids. */
+const GREEK = { alpha: 'a', beta: 'b', gamma: 'g', delta: 'd', epsilon: 'e', omega: 'o', 'α': 'a', 'β': 'b', 'γ': 'g', 'δ': 'd', 'ε': 'e', 'ω': 'o' };
+const STOP = new Set(['acid', 'ion', 'the', 'of', 'and', 'a', 'an']);
+function hash36(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h.toString(36); }
+function normName(name) {
+  let s = (name || '').toLowerCase();
+  s = s.replace(/\([rs+\-]\)-?|(^|[^a-z])[dl]-/g, ' ');        // (R)- (S)- (+)- D- L- stereodescriptors
+  Object.keys(GREEK).forEach(g => { s = s.replace(new RegExp(g, 'g'), GREEK[g]); });
+  return s;
+}
+function slugify(name, kind) {
+  let s = normName(name);
+  const words = s.split(/[^a-z0-9]+/).filter(w => w && !STOP.has(w));
+  let base;
+  const joined = words.join('');
+  if (joined.length <= 10) base = joined;
+  else if (words.length >= 2) base = words.map(w => w.length <= 4 ? w : w[0] + w.slice(1).replace(/[aeiou]/g, '').slice(0, 3)).join('').slice(0, 12);
+  else base = joined.replace(/[aeiou]/g, m => '').slice(0, 8) || joined.slice(0, 8);
+  base = base.replace(/[^a-z0-9]/g, '');
+  if (!base) base = 'cpd' + hash36(name || 'x').slice(0, 4);
+  return kind === 'rxn' ? base.toUpperCase() : base;
+}
+function mintBiggLike(name, fallback, kind, taken, realHas) {
+  let base = slugify(name || fallback || '', kind);
+  // never silently claim a real BiGG id, and never collide with another minted id (unless same source name)
+  const key0 = base;
+  if (taken.has(base) && taken.get(base) !== (name || fallback)) base = base + hash36(name || fallback).slice(0, 3);
+  else if (realHas(base)) base = base + hash36(name || fallback).slice(0, 3);
+  taken.set(base, name || fallback);
+  return base;
+}
 const EXRE = /^(EX_|DM_|SK_|sink_|R_EX_|demand)/i;
 function isExchange(r) { return EXRE.test(r.id) || Object.keys(r.s).length === 1; }
 function isBiomass(r) { return /biomass|_bio\b|^BIO_|objective/i.test(r.id) || /biomass/i.test(r.name || ''); }
@@ -264,17 +300,25 @@ function computeMassCharge(model, pH) {
 
 function curate(model) {
   // --- identifiers ---
-  let mBigg = 0, mLike = 0, mUn = 0;
-  model.mets.forEach(m => { const c = canonMet(m); m.canon = c; if (!c) mUn++; else if (c.biggr) mBigg++; else mLike++; });
-  let rBigg = 0, rLike = 0, rUn = 0;
-  model.rxns.forEach(r => { if (isExchange(r)) { r.canon = { bigg: baseId(r.id), biggr: true, exch: true }; return; } const c = canonRxn(r); r.canon = c; if (!c) rUn++; else if (c.biggr) rBigg++; else rLike++; });
+  const realHasMet = (b) => !!REF.met['bigg:' + b], realHasRxn = (b) => !!REF.rxn['bigg:' + b];
+  const takenMet = new Map(), takenRxn = new Map();
+  let mBigg = 0, mLike = 0, mGen = 0, mUn = 0;
+  model.mets.forEach(m => { const c = canonMet(m);
+    if (c) { m.canon = c; if (c.biggr) mBigg++; else mLike++; }
+    else { m.canon = { bigg: mintBiggLike(m.name, baseId(m.id), 'met', takenMet, realHasMet), biggr: false, generated: true }; mGen++; } });
+  let rBigg = 0, rLike = 0, rGen = 0, rUn = 0;
+  model.rxns.forEach(r => { if (isExchange(r)) { r.canon = { bigg: baseId(r.id), biggr: true, exch: true }; return; } const c = canonRxn(r);
+    if (c) { r.canon = c; if (c.biggr) rBigg++; else rLike++; }
+    else { r.canon = { bigg: mintBiggLike(r.name, baseId(r.id), 'rxn', takenRxn, realHasRxn), biggr: false, generated: true }; rGen++; } });
   const idIssues = [];
-  model.mets.forEach(m => { if (m.canon && m.canon.bigg !== baseId(m.id)) idIssues.push({ id: 'mid_' + m.id, cat: 'ids', sev: m.canon.biggr ? 'info' : 'warn', kind: 'met',
+  const noteMet = (c) => c.biggr ? 'canonical BiGG id' : c.generated ? 'BiGG-like id synthesised from the metabolite name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (compound not in BiGG; canonical across KEGG/ModelSEED/MetaNetX)';
+  const noteRxn = (c) => c.biggr ? 'canonical BiGG reaction id' : c.generated ? 'BiGG-like id synthesised from the reaction name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (reaction not in BiGG; canonical across KEGG/ModelSEED/RHEA)';
+  model.mets.forEach(m => { if (m.canon && m.canon.bigg !== baseId(m.id)) idIssues.push({ id: 'mid_' + m.id, cat: 'ids', sev: m.canon.biggr ? 'info' : 'warn', kind: 'met', generated: !!m.canon.generated,
     title: `Metabolite <code>${esc(m.id)}</code>`, from: baseId(m.id), to: m.canon.bigg + '_' + m.compartment, biggr: m.canon.biggr,
-    note: m.canon.biggr ? 'canonical BiGG id' : 'BiGG-like id (compound not in BiGG; canonical across KEGG/ModelSEED/MetaNetX)', apply: { met: m.id, newId: m.canon.bigg + '_' + m.compartment } }); });
-  model.rxns.forEach(r => { if (r.canon && !r.canon.exch && r.canon.bigg !== baseId(r.id)) idIssues.push({ id: 'rid_' + r.id, cat: 'ids', sev: r.canon.biggr ? 'info' : 'warn', kind: 'rxn',
+    note: noteMet(m.canon), apply: { met: m.id, newId: m.canon.bigg + '_' + m.compartment } }); });
+  model.rxns.forEach(r => { if (r.canon && !r.canon.exch && r.canon.bigg !== baseId(r.id)) idIssues.push({ id: 'rid_' + r.id, cat: 'ids', sev: r.canon.biggr ? 'info' : 'warn', kind: 'rxn', generated: !!r.canon.generated,
     title: `Reaction <code>${esc(r.id)}</code>`, from: baseId(r.id), to: r.canon.bigg, biggr: r.canon.biggr,
-    note: r.canon.biggr ? 'canonical BiGG reaction id' : 'BiGG-like id (reaction not in BiGG; canonical across KEGG/ModelSEED/RHEA)', apply: { rxn: r.id, newId: r.canon.bigg } }); });
+    note: noteRxn(r.canon), apply: { rxn: r.id, newId: r.canon.bigg } }); });
 
   // --- discrepancies: distinct model ids that canonicalise to the SAME BiGG id ---
   const dup = {};
@@ -308,7 +352,7 @@ function curate(model) {
   const { massIss, chargeIss } = computeMassCharge(model, DEFAULT_PH);
 
   return { idIssues, discrep, structure, orphan, massIss, chargeIss, ph: DEFAULT_PH,
-    counts: { mBigg, mLike, mUn, rBigg, rLike, rUn, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
+    counts: { mBigg, mLike, mGen, mUn, rBigg, rLike, rGen, rUn, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
       exch: model.rxns.filter(isExchange).length, dead: structure.length, mass: massIss.length, charge: chargeIss.length,
       dupMet: discrep.filter(d => d.kind === 'dupmet').length, dupRxn: discrep.filter(d => d.kind === 'duprxn').length } };
 }
@@ -368,9 +412,9 @@ function drawVizIds(c) {
   const ink = dark ? '#C2CFE0' : '#334155';
   const base = { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { family: 'Fira Sans, sans-serif', size: 11, color: ink }, margin: { l: 8, r: 8, t: 26, b: 8 } };
   const cfg = { responsive: true, displayModeBar: false };
-  const donut = (id, title, vals) => window.Plotly.newPlot(id, [{ type: 'pie', hole: .62, labels: ['BiGG', 'BiGG-like', 'unmapped'], values: vals, marker: { colors: ['#15803D', '#2563EB', '#B45309'] }, textinfo: 'percent', textfont: { size: 10 }, hovertemplate: '%{label}: %{value}<extra></extra>', sort: false }], Object.assign({}, base, { title: { text: title, font: { size: 12 } }, showlegend: false, annotations: [{ text: fmt(vals[0] + vals[1] + vals[2]), x: .5, y: .5, showarrow: false, font: { size: 15, color: ink } }] }), cfg);
-  donut('viz-met', 'Metabolite ids', [c.mBigg, c.mLike, c.mUn]);
-  donut('viz-rxn', 'Reaction ids', [c.rBigg, c.rLike, c.rUn]);
+  const donut = (id, title, vals) => window.Plotly.newPlot(id, [{ type: 'pie', hole: .62, labels: ['BiGG', 'BiGG-like (cross-ref)', 'BiGG-like (synthesised)'], values: vals, marker: { colors: ['#15803D', '#2563EB', '#7C3AED'] }, textinfo: 'percent', textfont: { size: 10 }, hovertemplate: '%{label}: %{value}<extra></extra>', sort: false }], Object.assign({}, base, { title: { text: title, font: { size: 12 } }, showlegend: false, annotations: [{ text: fmt(vals[0] + vals[1] + vals[2]), x: .5, y: .5, showarrow: false, font: { size: 15, color: ink } }] }), cfg);
+  donut('viz-met', 'Metabolite ids', [c.mBigg, c.mLike, c.mGen]);
+  donut('viz-rxn', 'Reaction ids', [c.rBigg, c.rLike, c.rGen]);
   const labels = ['Renames', 'Dup metabolites', 'Dup reactions', 'Dead-ends', 'Mass imbalance', 'Charge imbalance'];
   const vals = [RESULT.idIssues.length, c.dupMet, c.dupRxn, c.dead, c.mass, c.charge];
   const cols = ['#2563EB', '#DC2626', '#DC2626', '#B45309', '#DC2626', '#B45309'];
@@ -380,7 +424,7 @@ function drawVizIds(c) {
 function renderIds() {
   const s = $('stage-ids'); s.innerHTML = ''; const c = RESULT.counts;
   s.appendChild(el('div', 'ac-sh', `<h2>Identifier mapping</h2><p>Every metabolite and reaction identifier is resolved against <b>BiGG</b> — and, when a compound or reaction exists only in KEGG / ModelSEED / MetaNetX / ChEBI / RHEA, a deterministic <b>BiGG-like</b> id so your model stays internally consistent and portable.</p>`));
-  s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mUn, 'metabolites unmapped', c.mUn ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rUn, 'reactions unmapped', c.rUn ? 'warn' : 'ok')));
+  s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mGen, 'metabolites → synthesised id', c.mGen ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rGen, 'reactions → synthesised id', c.rGen ? 'warn' : 'ok')));
   const pct = Math.round(100 * (c.mBigg + c.mLike) / Math.max(1, c.mets));
   // --- dashboard visualisation: coverage donuts + issue overview ---
   const viz = el('div', 'ac-card'); viz.appendChild(el('h3', '', 'Curation overview'));
