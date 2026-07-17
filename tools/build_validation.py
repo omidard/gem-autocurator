@@ -31,10 +31,12 @@ def strain_std(text):
     m = re.search(r"\b(" + _CC + r")\s*[-: ]?\s*(\d+[A-Za-z]?)\b", t, re.I)
     if m:
         return (m.group(1) + m.group(2)).upper()
-    m = re.search(r"substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t, re.I) or re.search(r"(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t, re.I)
-    if m and re.search(r"\d", m.group(1)):
-        return re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
-    m = re.search(r"\b([A-Z]{1,4}\d{2,6}[A-Za-z]?)\b", t)
+    m = re.search(r"substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t, re.I) or re.search(r"(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t)
+    if m:
+        tok = m.group(1)
+        if not re.match(r"^(wild|type|unknown|unspecified|isolate|sp|strain|and|the|not|clinical|reference|derivative|derivatives|mutant|parent|parental)$", tok, re.I) and (re.search(r"\d", tok) or re.match(r"^[A-Z]", tok)):
+            return re.sub(r"[^A-Z0-9]", "", tok.upper())
+    m = re.search(r"\b([A-Z]{1,4}\d{1,6}[A-Za-z]?)\b", t)
     if m:
         return m.group(1).upper()
     if re.search(r"\bK-?12\b", t, re.I):

@@ -127,19 +127,35 @@ function xrefFromCV(node) {
 }
 
 /* ---------------- curation engine ---------------- */
+// recognise when an identifier IS a database id, so we probe the right cross-ref namespace
+const DBID_MET = [[/^C\d{5}$/i, 'kegg'], [/^cpd\d{5,}$/i, 'seed'], [/^MNXM\d+$/i, 'mnx'], [/^CHEBI[:_]?(\d+)$/i, 'chebi'], [/^HMDB\d+$/i, 'hmdb'], [/^([A-Z]{14}-[A-Z]{10}-[A-Z])$/i, 'inchikey']];
+const DBID_RXN = [[/^R\d{5}$/i, 'kegg'], [/^rxn\d{5,}$/i, 'seed'], [/^MNXR\d+$/i, 'mnx'], [/^(\d{5,})$/, 'rhea']];
+const DBNS_NAME = { kegg: 'KEGG', seed: 'ModelSEED', mnx: 'MetaNetX', chebi: 'ChEBI', rhea: 'Rhea', hmdb: 'HMDB', inchikey: 'InChIKey' };
+function dbIdOf(base, table) { for (const [re, ns] of table) { const mm = base.match(re); if (mm) return { ns, id: mm[1] || base }; } return null; }
 function canonMet(m) {
-  const M = REF.met;
-  let hit = M['bigg:' + baseId(m.id)];                       // direct BiGG id
-  if (!hit) for (const [ns, v] of Object.entries(m.anno || {})) { hit = M[ns + ':' + v]; if (hit) break; }
+  const M = REF.met; const base = baseId(m.id);
+  let hit = M['bigg:' + base];                                       // direct BiGG id
+  if (!hit) { const d = dbIdOf(base, DBID_MET); if (d) hit = M[d.ns + ':' + d.id]; }   // id is itself a DB id (KEGG/SEED/MNX/ChEBI/InChIKey)
+  if (!hit) for (const [ns, v] of Object.entries(m.anno || {})) { hit = M[ns + ':' + v] || (ns === 'chebi' ? M['chebi:' + String(v).replace(/^CHEBI:?/i, '')] : null); if (hit) break; }
+  if (!hit && m.anno && m.anno.inchikey) hit = M['inchikey:' + m.anno.inchikey];   // full InChIKey = exact chemical identity
   if (!hit && m.name) hit = M['name:' + m.name.toLowerCase().replace(/[^a-z0-9]/g, '')];
   return hit || null;
 }
 function canonRxn(r) {
-  const R = REF.rxn;
-  let hit = R['bigg:' + baseId(r.id)];
-  if (!hit) hit = R['old:' + baseId(r.id)];
+  const R = REF.rxn; const base = baseId(r.id);
+  let hit = R['bigg:' + base];
+  if (!hit) hit = R['old:' + base];
+  if (!hit) { const d = dbIdOf(base, DBID_RXN); if (d) hit = R[d.ns + ':' + d.id]; }
   if (!hit) for (const [ns, v] of Object.entries(r.anno || {})) { hit = R[ns + ':' + v]; if (hit) break; }
   return hit || null;
+}
+// strongest available chemical identity for merging duplicates (compartment handled separately)
+function identityKey(m) {
+  if (m.anno && m.anno.inchikey) return 'ik:' + m.anno.inchikey;         // exact structure incl. stereo
+  if (m.canon && !m.canon.generated) return 'bg:' + m.canon.bigg;        // resolved BiGG / BiGG-like
+  if (m.canon && m.canon.generated === 'dbid') return 'db:' + m.canon.bigg;   // same DB id = same compound
+  if (m.anno && m.anno.chebi) return 'chebi:' + String(m.anno.chebi).replace(/^CHEBI:?/i, '');
+  return null;                                                            // identity unknown -> never merge
 }
 
 /* ---------------- robust BiGG-like id synthesis ----------------
@@ -314,40 +330,49 @@ function curate(model) {
   // --- identifiers ---
   const realHasMet = (b) => !!REF.met['bigg:' + b], realHasRxn = (b) => !!REF.rxn['bigg:' + b];
   const takenMet = new Map(), takenRxn = new Map();
-  let mBigg = 0, mLike = 0, mGen = 0, mUn = 0;
-  model.mets.forEach(m => { const c = canonMet(m);
-    if (c) { m.canon = c; if (c.biggr) mBigg++; else mLike++; }
-    else { m.canon = { bigg: mintBiggLike(m.name, baseId(m.id), 'met', takenMet, realHasMet), biggr: false, generated: true }; mGen++; } });
-  let rBigg = 0, rLike = 0, rGen = 0, rUn = 0;
-  model.rxns.forEach(r => { if (isExchange(r)) { r.canon = { bigg: baseId(r.id), biggr: true, exch: true }; return; } const c = canonRxn(r);
-    if (c) { r.canon = c; if (c.biggr) rBigg++; else rLike++; }
-    else { r.canon = { bigg: mintBiggLike(r.name, baseId(r.id), 'rxn', takenRxn, realHasRxn), biggr: false, generated: true }; rGen++; } });
+  const unresolved = [];   // ids recognised as a DB identifier but not resolvable to BiGG offline
+  let mBigg = 0, mLike = 0, mGen = 0, mDb = 0;
+  model.mets.forEach(m => { const c = canonMet(m); const base = baseId(m.id);
+    if (c) { m.canon = c; if (c.biggr) mBigg++; else mLike++; return; }
+    const db = dbIdOf(base, DBID_MET);
+    if (db) { m.canon = { bigg: base, biggr: false, generated: 'dbid', dbns: db.ns }; mDb++; unresolved.push({ id: m.id, base, ns: db.ns, kind: 'met' }); }
+    else { m.canon = { bigg: mintBiggLike(m.name, base, 'met', takenMet, realHasMet), biggr: false, generated: 'name' }; mGen++; } });
+  let rBigg = 0, rLike = 0, rGen = 0, rDb = 0;
+  model.rxns.forEach(r => { if (isExchange(r)) { r.canon = { bigg: baseId(r.id), biggr: true, exch: true }; return; } const c = canonRxn(r); const base = baseId(r.id);
+    if (c) { r.canon = c; if (c.biggr) rBigg++; else rLike++; return; }
+    const db = dbIdOf(base, DBID_RXN);
+    if (db) { r.canon = { bigg: base, biggr: false, generated: 'dbid', dbns: db.ns }; rDb++; unresolved.push({ id: r.id, base, ns: db.ns, kind: 'rxn' }); }
+    else { r.canon = { bigg: mintBiggLike(r.name, base, 'rxn', takenRxn, realHasRxn), biggr: false, generated: 'name' }; rGen++; } });
   const idIssues = [];
-  const noteMet = (c) => c.biggr ? 'canonical BiGG id' : c.generated ? 'BiGG-like id synthesised from the metabolite name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (compound not in BiGG; canonical across KEGG/ModelSEED/MetaNetX)';
-  const noteRxn = (c) => c.biggr ? 'canonical BiGG reaction id' : c.generated ? 'BiGG-like id synthesised from the reaction name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (reaction not in BiGG; canonical across KEGG/ModelSEED/RHEA)';
-  model.mets.forEach(m => { if (m.canon && m.canon.bigg !== baseId(m.id)) idIssues.push({ id: 'mid_' + m.id, cat: 'ids', sev: m.canon.biggr ? 'info' : 'warn', kind: 'met', generated: !!m.canon.generated,
+  const noteMet = (c) => c.biggr ? 'canonical BiGG id' : c.generated === 'name' ? 'BiGG-like id synthesised from the metabolite name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (compound not in BiGG; canonical across KEGG/ModelSEED/MetaNetX)';
+  const noteRxn = (c) => c.biggr ? 'canonical BiGG reaction id' : c.generated === 'name' ? 'BiGG-like id synthesised from the reaction name (not in BiGG or any cross-ref DB)' : 'BiGG-like id (reaction not in BiGG; canonical across KEGG/ModelSEED/RHEA)';
+  // renames: only where the canonical id genuinely differs (dbid ids are kept as-is, so excluded here)
+  model.mets.forEach(m => { if (m.canon && !m.canon.generated || (m.canon && m.canon.generated === 'name')) { if (m.canon.bigg !== baseId(m.id)) idIssues.push({ id: 'mid_' + m.id, cat: 'ids', sev: m.canon.biggr ? 'info' : 'warn', kind: 'met', generated: m.canon.generated === 'name',
     title: `Metabolite <code>${esc(m.id)}</code>`, from: baseId(m.id), to: m.canon.bigg + '_' + m.compartment, biggr: m.canon.biggr,
-    note: noteMet(m.canon), apply: { met: m.id, newId: m.canon.bigg + '_' + m.compartment } }); });
-  model.rxns.forEach(r => { if (r.canon && !r.canon.exch && r.canon.bigg !== baseId(r.id)) idIssues.push({ id: 'rid_' + r.id, cat: 'ids', sev: r.canon.biggr ? 'info' : 'warn', kind: 'rxn', generated: !!r.canon.generated,
+    note: noteMet(m.canon), apply: { met: m.id, newId: m.canon.bigg + '_' + m.compartment } }); } });
+  model.rxns.forEach(r => { if (r.canon && !r.canon.exch && (!r.canon.generated || r.canon.generated === 'name')) { if (r.canon.bigg !== baseId(r.id)) idIssues.push({ id: 'rid_' + r.id, cat: 'ids', sev: r.canon.biggr ? 'info' : 'warn', kind: 'rxn', generated: r.canon.generated === 'name',
     title: `Reaction <code>${esc(r.id)}</code>`, from: baseId(r.id), to: r.canon.bigg, biggr: r.canon.biggr,
-    note: noteRxn(r.canon), apply: { rxn: r.id, newId: r.canon.bigg } }); });
+    note: noteRxn(r.canon), apply: { rxn: r.id, newId: r.canon.bigg } }); } });
 
-  // --- discrepancies: distinct model ids that canonicalise to the SAME BiGG id ---
+  // --- discrepancies: distinct model ids that are the SAME chemical entity IN THE SAME COMPARTMENT ---
+  // Identity is decided by InChIKey > resolved BiGG id > ChEBI (compartment is NOT an identity — _c/_e/_h stay separate).
   const dup = {};
-  model.mets.forEach(m => { if (!m.canon) return; const key = m.canon.bigg + '@' + m.compartment; (dup[key] = dup[key] || []).push(m); });
+  model.mets.forEach(m => { const ik = identityKey(m); if (!ik) return; const key = ik + '@@' + m.compartment; (dup[key] = dup[key] || []).push(m); });
   const discrep = [];
-  Object.entries(dup).forEach(([key, arr]) => { if (arr.length > 1) discrep.push({ id: 'dupm_' + key, cat: 'discrep', sev: 'bad', kind: 'dupmet',
-    title: `${arr.length} metabolites collapse to one`, ids: arr.map(m => m.id), to: key.replace('@', '_'),
-    note: `<code>${arr.map(m => esc(m.id)).join('</code>, <code>')}</code> all resolve to <span class="to">${esc(key.replace('@', '_'))}</span> — likely duplicate species with different names/ids.`,
-    apply: { merge: arr.map(m => m.id), into: key.split('@')[0] + '_' + key.split('@')[1] } }); });
+  Object.values(dup).forEach(arr => { if (arr.length < 2) return;
+    const comp = arr[0].compartment;
+    const target = (arr.map(m => m.canon).find(c => c && c.biggr) || arr[0].canon).bigg;   // prefer a real BiGG id as the merge target
+    const into = target + '_' + comp;
+    discrep.push({ id: 'dupm_' + into, cat: 'discrep', sev: 'bad', kind: 'dupmet',
+      title: `${arr.length} metabolites are the same compound`, ids: arr.map(m => m.id), to: into,
+      note: `<code>${arr.map(m => esc(m.id)).join('</code>, <code>')}</code> are the same species in compartment <b>${esc(comp)}</b> (matched by ${arr.some(m => m.anno && m.anno.inchikey) ? 'InChIKey' : 'shared identifier'}) → merge to <span class="to">${esc(into)}</span>.`,
+      apply: { merge: arr.map(m => m.id), into } });
+  });
   const rdup = {};
-  model.rxns.forEach(r => { if (!r.canon || r.canon.exch) return; (rdup[r.canon.bigg] = rdup[r.canon.bigg] || []).push(r); });
+  model.rxns.forEach(r => { if (!r.canon || r.canon.exch || r.canon.generated === 'name') return; (rdup[r.canon.bigg] = rdup[r.canon.bigg] || []).push(r); });
   Object.entries(rdup).forEach(([b, arr]) => { if (arr.length > 1) discrep.push({ id: 'dupr_' + b, cat: 'discrep', sev: 'bad', kind: 'duprxn',
     title: `${arr.length} reactions collapse to one`, ids: arr.map(r => r.id), to: b,
     note: `<code>${arr.map(r => esc(r.id)).join('</code>, <code>')}</code> all resolve to <span class="to">${esc(b)}</span> — duplicate reactions.`, apply: { mergeRxn: arr.map(r => r.id), into: b } }); });
-  // name conflicts: same canon, different display names
-  const nmeBy = {};
-  model.mets.forEach(m => { if (!m.canon) return; (nmeBy[m.canon.bigg] = nmeBy[m.canon.bigg] || new Set()).add((m.name || '').trim()); });
 
   // --- structural QC ---
   const prod = {}, cons = {}, deg = {};
@@ -363,8 +388,8 @@ function curate(model) {
   // --- mass & charge imbalance (charge is pH-dependent) ---
   const { massIss, chargeIss } = computeMassCharge(model, DEFAULT_PH);
 
-  return { idIssues, discrep, structure, orphan, massIss, chargeIss, ph: DEFAULT_PH,
-    counts: { mBigg, mLike, mGen, mUn, rBigg, rLike, rGen, rUn, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
+  return { idIssues, discrep, structure, orphan, massIss, chargeIss, unresolved, ph: DEFAULT_PH,
+    counts: { mBigg, mLike, mGen, mDb, rBigg, rLike, rGen, rDb, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
       exch: model.rxns.filter(isExchange).length, dead: structure.length, mass: massIss.length, charge: chargeIss.length,
       dupMet: discrep.filter(d => d.kind === 'dupmet').length, dupRxn: discrep.filter(d => d.kind === 'duprxn').length } };
 }
@@ -424,9 +449,9 @@ function drawVizIds(c) {
   const ink = dark ? '#C2CFE0' : '#334155';
   const base = { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { family: 'Fira Sans, sans-serif', size: 11, color: ink }, margin: { l: 8, r: 8, t: 26, b: 8 } };
   const cfg = { responsive: true, displayModeBar: false };
-  const donut = (id, title, vals) => window.Plotly.newPlot(id, [{ type: 'pie', hole: .62, labels: ['BiGG', 'BiGG-like (cross-ref)', 'BiGG-like (synthesised)'], values: vals, marker: { colors: ['#15803D', '#2563EB', '#7C3AED'] }, textinfo: 'percent', textfont: { size: 10 }, hovertemplate: '%{label}: %{value}<extra></extra>', sort: false }], Object.assign({}, base, { title: { text: title, font: { size: 12 } }, showlegend: false, annotations: [{ text: fmt(vals[0] + vals[1] + vals[2]), x: .5, y: .5, showarrow: false, font: { size: 15, color: ink } }] }), cfg);
-  donut('viz-met', 'Metabolite ids', [c.mBigg, c.mLike, c.mGen]);
-  donut('viz-rxn', 'Reaction ids', [c.rBigg, c.rLike, c.rGen]);
+  const donut = (id, title, vals) => window.Plotly.newPlot(id, [{ type: 'pie', hole: .62, labels: ['BiGG', 'BiGG-like (cross-ref)', 'BiGG-like (synthesised)', 'unresolved DB id'], values: vals, marker: { colors: ['#15803D', '#2563EB', '#7C3AED', '#B45309'] }, textinfo: 'percent', textfont: { size: 10 }, hovertemplate: '%{label}: %{value}<extra></extra>', sort: false }], Object.assign({}, base, { title: { text: title, font: { size: 12 } }, showlegend: false, annotations: [{ text: fmt(vals[0] + vals[1] + vals[2] + vals[3]), x: .5, y: .5, showarrow: false, font: { size: 15, color: ink } }] }), cfg);
+  donut('viz-met', 'Metabolite ids', [c.mBigg, c.mLike, c.mGen, c.mDb]);
+  donut('viz-rxn', 'Reaction ids', [c.rBigg, c.rLike, c.rGen, c.rDb]);
   const labels = ['Renames', 'Dup metabolites', 'Dup reactions', 'Dead-ends', 'Mass imbalance', 'Charge imbalance'];
   const vals = [RESULT.idIssues.length, c.dupMet, c.dupRxn, c.dead, c.mass, c.charge];
   const cols = ['#2563EB', '#DC2626', '#DC2626', '#B45309', '#DC2626', '#B45309'];
@@ -436,7 +461,7 @@ function drawVizIds(c) {
 function renderIds() {
   const s = $('stage-ids'); s.innerHTML = ''; const c = RESULT.counts;
   s.appendChild(el('div', 'ac-sh', `<h2>Identifier mapping</h2><p>Every metabolite and reaction identifier is resolved against <b>BiGG</b> — and, when a compound or reaction exists only in KEGG / ModelSEED / MetaNetX / ChEBI / RHEA, a deterministic <b>BiGG-like</b> id so your model stays internally consistent and portable.</p>`));
-  s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mGen, 'metabolites → synthesised id', c.mGen ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rGen, 'reactions → synthesised id', c.rGen ? 'warn' : 'ok')));
+  s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mGen, 'metabolites → synthesised id', c.mGen ? 'warn' : 'ok') + kpi(c.mDb, 'metabolites → unresolved DB id', c.mDb ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rGen, 'reactions → synthesised id', c.rGen ? 'warn' : 'ok') + kpi(c.rDb, 'reactions → unresolved DB id', c.rDb ? 'warn' : 'ok')));
   const pct = Math.round(100 * (c.mBigg + c.mLike) / Math.max(1, c.mets));
   // --- dashboard visualisation: coverage donuts + issue overview ---
   const viz = el('div', 'ac-card'); viz.appendChild(el('h3', '', 'Curation overview'));
@@ -451,14 +476,24 @@ function renderIds() {
   card.appendChild(el('div', 'sub', 'Approve to rename in the exported model; reject to keep the original id. Exchange/demand reactions are left as-is.'));
   issueList(card, RESULT.idIssues, 'Every identifier already matches its canonical form. Nothing to rename.');
   s.appendChild(card);
-  s.appendChild(el('div', 'ac-interp', `<b>Interpretation.</b> ${pct}% of metabolites resolved to a canonical id (${c.mBigg} exact BiGG, ${c.mLike} BiGG-like). ${c.mUn ? `<b>${c.mUn}</b> metabolites and <b>${c.rUn}</b> reactions could not be resolved from their id or annotations — they keep their original ids and are listed under Discrepancies for review.` : 'Full coverage — every id maps to a curated reference.'}`));
+  // recognised-but-unresolvable database identifiers (kept as-is, NOT relabelled as name-synthesised)
+  if (RESULT.unresolved && RESULT.unresolved.length) {
+    const uc = el('div', 'ac-card'); uc.appendChild(el('h3', '', 'Recognised database identifiers, not in BiGG'));
+    uc.appendChild(el('div', 'sub', 'These ids are valid identifiers in another database (KEGG / ModelSEED / MetaNetX / ChEBI / Rhea) but are not present in BiGG or our offline cross-reference tables, so they could not be mapped. They are kept unchanged — resolve them online if you need a BiGG id.'));
+    const ul = el('div', 'ac-issues');
+    RESULT.unresolved.slice(0, 200).forEach(u => ul.appendChild(el('div', 'ac-issue sev-info', `<div class="txt" style="flex:1"><div class="ttl"><code>${esc(u.id)}</code></div><div class="note" style="font-size:12px">recognised as a <b>${esc(DBNS_NAME[u.ns] || u.ns)}</b> ${u.kind === 'met' ? 'compound' : 'reaction'} id — kept as-is (not in BiGG / cross-refs)</div></div>`)));
+    uc.appendChild(ul);
+    if (RESULT.unresolved.length > 200) uc.appendChild(el('div', 'sub', `… and ${fmt(RESULT.unresolved.length - 200)} more.`));
+    s.appendChild(uc);
+  }
+  s.appendChild(el('div', 'ac-interp', `<b>Interpretation.</b> ${pct}% of metabolites resolved to a canonical id (${c.mBigg} exact BiGG, ${c.mLike} BiGG-like). ${(c.mDb + c.rDb) ? `<b>${c.mDb}</b> metabolites and <b>${c.rDb}</b> reactions carry a recognised database id (KEGG/ModelSEED/…) that isn't in BiGG or our cross-refs — kept unchanged, listed above. ` : ''}${(c.mGen + c.rGen) ? `<b>${c.mGen}</b> metabolites and <b>${c.rGen}</b> reactions had no database id at all and were given a name-synthesised BiGG-like id.` : (c.mDb + c.rDb ? '' : 'Full coverage — every id maps to a curated reference.')}`));
   navCount('ids', RESULT.idIssues.length, RESULT.idIssues.length ? 'warn' : 'ok');
 }
 function renderDiscrep() {
   const s = $('stage-discrep'); s.innerHTML = '';
   s.appendChild(el('div', 'ac-sh', `<h2>Discrepancies</h2><p>The most consequential curation: when two different identifiers in your model refer to the <b>same</b> compound or reaction. Left uncurated, these split flux, break mass balance and inflate the network. Each is resolved to one canonical entity.</p>`));
   const c = RESULT.counts;
-  s.appendChild(el('div', 'ac-kpis', kpi(c.dupMet, 'duplicate metabolites', c.dupMet ? 'bad' : 'ok') + kpi(c.dupRxn, 'duplicate reactions', c.dupRxn ? 'bad' : 'ok') + kpi(c.mUn + c.rUn, 'unresolved ids', (c.mUn + c.rUn) ? 'warn' : 'ok')));
+  s.appendChild(el('div', 'ac-kpis', kpi(c.dupMet, 'duplicate metabolites', c.dupMet ? 'bad' : 'ok') + kpi(c.dupRxn, 'duplicate reactions', c.dupRxn ? 'bad' : 'ok') + kpi(c.mDb + c.rDb, 'unresolved DB ids', (c.mDb + c.rDb) ? 'warn' : 'ok')));
   const card = el('div', 'ac-card'); card.appendChild(el('h3', '', 'Duplicate entities to merge'));
   card.appendChild(el('div', 'sub', 'Approve to merge the listed ids into the single canonical id in the exported model.'));
   issueList(card, RESULT.discrep, 'No two identifiers collapse to the same entity — your namespace is clean.');
@@ -594,16 +629,23 @@ function matchSpecies(query, limit) {
 }
 /* ---- organism + strain auto-detection (strain name / GCF-GCA accession / BV-BRC id / taxon) ---- */
 const _SCC = 'ATCC|DSMZ|DSM|NCTC|CCUG|JCM|NBRC|IFO|CECT|LMG|CIP|NCIMB|BCRC|KCTC|NRRL|CGMCC|MCCC|PCC|UTEX|CBS|KACC|VPI|NCDO|NCFB|BCCM|KCCM';
+const _STRAIN_STOP = /^(wild|type|unknown|unspecified|isolate|sp|strain|and|the|not|clinical|reference|derivative|derivatives|mutant|parent|parental)$/i;
 function strainStd(text) {   // mirror of build_validation.py strain_std: free-text strain -> comparable token
   if (!text) return null; const t = String(text);
   let m = t.match(new RegExp('\\b(' + _SCC + ')\\s*[-: ]?\\s*(\\d+[A-Za-z]?)\\b', 'i'));
   if (m) return (m[1] + m[2]).toUpperCase();
-  m = t.match(/substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]+)/i) || t.match(/(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]+)/i);
-  if (m && /\d/.test(m[1])) return m[1].toUpperCase().replace(/[^A-Z0-9]/g, '');
-  m = t.match(/\b([A-Z]{1,4}\d{2,6}[A-Za-z]?)\b/);
+  // designation after substr./str./strain — a digit OR a capitalised proper name (e.g. "str. Sakai")
+  m = t.match(/substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]+)/i) || t.match(/(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]+)/);
+  if (m && !_STRAIN_STOP.test(m[1]) && (/\d/.test(m[1]) || /^[A-Z]/.test(m[1]))) return m[1].toUpperCase().replace(/[^A-Z0-9]/g, '');
+  m = t.match(/\b([A-Z]{1,4}\d{1,6}[A-Za-z]?)\b/);
   if (m) return m[1].toUpperCase();
   if (/\bK-?12\b/i.test(t)) return 'K12';
   return null;
+}
+function strainFromName(name) {   // infraspecific remainder of an NCBI organism name = the strain designation
+  if (!name) return null;
+  const sp = speciesNorm(name); const rest = String(name).slice(String(name).toLowerCase().indexOf(sp.toLowerCase()) + sp.length).trim();
+  return rest ? rest.replace(/^(str\.?|substr\.?)\s+/i, '') : null;
 }
 function strainMatch(recSstd, recStrain, detTok) {
   if (!detTok) return false;
@@ -617,8 +659,8 @@ async function ncbiJson(url) { try { const r = await fetch(url); if (!r.ok) retu
 async function ncbiOrgFromAccession(acc) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/' + encodeURIComponent(acc) + '/dataset_report'); const rep = d && d.reports && d.reports[0]; const o = rep && rep.organism; if (!o) return null; const inf = o.infraspecific_names || {}; return { name: o.organism_name, taxid: o.tax_id, strain: inf.strain || inf.isolate || null }; }
 async function ncbiOrgFromTaxon(tid) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/taxonomy/taxon/' + encodeURIComponent(tid)); const n = d && d.taxonomy_nodes && d.taxonomy_nodes[0] && d.taxonomy_nodes[0].taxonomy; return n ? { name: n.organism_name, taxid: n.tax_id } : null; }
 function withStrain(res, srcText, ncbiStrain, ncbiName) {
-  const s = ncbiStrain || strainStd(ncbiName || '') || strainStd(srcText || '');
-  res.strain = ncbiStrain || null; res.sstd = strainStd(ncbiStrain || '') || strainStd(ncbiName || '') || strainStd(srcText || '') || null;
+  res.strain = ncbiStrain || strainFromName(ncbiName) || null;   // human-readable strain designation
+  res.sstd = strainStd(ncbiStrain || '') || strainStd(ncbiName || '') || strainStd(srcText || '') || null;
   return res;
 }
 async function resolveOrganism(text) {
