@@ -592,22 +592,47 @@ function matchSpecies(query, limit) {
     return { sp, score, n: (GDB.bySpecies[sp] || []).length };
   }).filter(x => x.score > 0).sort((a, b) => b.score - a.score || b.n - a.n).slice(0, limit || 8);
 }
-/* ---- organism auto-detection (strain name / GCF-GCA accession / BV-BRC id / taxon) ---- */
+/* ---- organism + strain auto-detection (strain name / GCF-GCA accession / BV-BRC id / taxon) ---- */
+const _SCC = 'ATCC|DSMZ|DSM|NCTC|CCUG|JCM|NBRC|IFO|CECT|LMG|CIP|NCIMB|BCRC|KCTC|NRRL|CGMCC|MCCC|PCC|UTEX|CBS|KACC|VPI|NCDO|NCFB|BCCM|KCCM';
+function strainStd(text) {   // mirror of build_validation.py strain_std: free-text strain -> comparable token
+  if (!text) return null; const t = String(text);
+  let m = t.match(new RegExp('\\b(' + _SCC + ')\\s*[-: ]?\\s*(\\d+[A-Za-z]?)\\b', 'i'));
+  if (m) return (m[1] + m[2]).toUpperCase();
+  m = t.match(/substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]+)/i) || t.match(/(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]+)/i);
+  if (m && /\d/.test(m[1])) return m[1].toUpperCase().replace(/[^A-Z0-9]/g, '');
+  m = t.match(/\b([A-Z]{1,4}\d{2,6}[A-Za-z]?)\b/);
+  if (m) return m[1].toUpperCase();
+  if (/\bK-?12\b/i.test(t)) return 'K12';
+  return null;
+}
+function strainMatch(recSstd, recStrain, detTok) {
+  if (!detTok) return false;
+  if (recSstd && recSstd === detTok) return true;
+  const rn = (recStrain || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (rn && rn.includes(detTok)) return true;
+  if (recSstd && (recSstd.includes(detTok) || detTok.includes(recSstd)) && detTok.length >= 4 && recSstd.length >= 4) return true;
+  return false;
+}
 async function ncbiJson(url) { try { const r = await fetch(url); if (!r.ok) return null; return await r.json(); } catch (e) { return null; } }
-async function ncbiOrgFromAccession(acc) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/' + encodeURIComponent(acc) + '/dataset_report'); const rep = d && d.reports && d.reports[0]; const o = rep && rep.organism; return o ? { name: o.organism_name, taxid: o.tax_id } : null; }
+async function ncbiOrgFromAccession(acc) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/' + encodeURIComponent(acc) + '/dataset_report'); const rep = d && d.reports && d.reports[0]; const o = rep && rep.organism; if (!o) return null; const inf = o.infraspecific_names || {}; return { name: o.organism_name, taxid: o.tax_id, strain: inf.strain || inf.isolate || null }; }
 async function ncbiOrgFromTaxon(tid) { const d = await ncbiJson('https://api.ncbi.nlm.nih.gov/datasets/v2/taxonomy/taxon/' + encodeURIComponent(tid)); const n = d && d.taxonomy_nodes && d.taxonomy_nodes[0] && d.taxonomy_nodes[0].taxonomy; return n ? { name: n.organism_name, taxid: n.tax_id } : null; }
+function withStrain(res, srcText, ncbiStrain, ncbiName) {
+  const s = ncbiStrain || strainStd(ncbiName || '') || strainStd(srcText || '');
+  res.strain = ncbiStrain || null; res.sstd = strainStd(ncbiStrain || '') || strainStd(ncbiName || '') || strainStd(srcText || '') || null;
+  return res;
+}
 async function resolveOrganism(text) {
   if (!text) return null; const t = String(text).trim();
   let m = t.match(/\bGC[AF]_?\d{6,}(?:\.\d+)?/i);
-  if (m) { let acc = m[0].toUpperCase().replace(/^(GC[AF])(\d)/, '$1_$2'); if (!/\.\d+$/.test(acc)) acc += '.1'; const o = await ncbiOrgFromAccession(acc); if (o) return { name: o.name, taxid: o.taxid, via: 'assembly ' + acc + ' · NCBI', conf: true }; }
+  if (m) { let acc = m[0].toUpperCase().replace(/^(GC[AF])(\d)/, '$1_$2'); if (!/\.\d+$/.test(acc)) acc += '.1'; const o = await ncbiOrgFromAccession(acc); if (o) return withStrain({ name: o.name, taxid: o.taxid, via: 'assembly ' + acc + ' · NCBI', conf: true }, t, o.strain, o.name); }
   m = t.match(/\b\d{9}(?:\.\d+)?\b/);
-  if (m) { const ver = /\.\d+$/.test(m[0]) ? m[0] : m[0] + '.1'; for (const pre of ['GCF_', 'GCA_']) { const o = await ncbiOrgFromAccession(pre + ver); if (o) return { name: o.name, taxid: o.taxid, via: 'assembly ' + pre + ver + ' · NCBI', conf: true }; } }
+  if (m) { const ver = /\.\d+$/.test(m[0]) ? m[0] : m[0] + '.1'; for (const pre of ['GCF_', 'GCA_']) { const o = await ncbiOrgFromAccession(pre + ver); if (o) return withStrain({ name: o.name, taxid: o.taxid, via: 'assembly ' + pre + ver + ' · NCBI', conf: true }, t, o.strain, o.name); } }
   m = t.match(/\b(\d{3,7})\.\d{1,3}\b/);
-  if (m) { const tid = m[1]; if (GDB.tax2sp && GDB.tax2sp[tid]) return { name: GDB.tax2sp[tid], taxid: tid, via: 'BV-BRC id ' + m[0] + ' · taxon ' + tid, conf: true }; const o = await ncbiOrgFromTaxon(tid); if (o) return { name: o.name, taxid: tid, via: 'BV-BRC id ' + m[0] + ' · NCBI taxon', conf: true }; }
+  if (m) { const tid = m[1]; const o = await ncbiOrgFromTaxon(tid); const sp = (GDB.tax2sp && GDB.tax2sp[tid]) || (o && o.name); if (sp) return withStrain({ name: sp, taxid: tid, via: 'BV-BRC id ' + m[0] + ' · taxon ' + tid + (o ? ' · NCBI' : ''), conf: true }, t, null, o && o.name); }
   m = t.match(/^\d{3,7}$/);
-  if (m) { const tid = m[0]; if (GDB.tax2sp && GDB.tax2sp[tid]) return { name: GDB.tax2sp[tid], taxid: tid, via: 'taxon ' + tid, conf: true }; const o = await ncbiOrgFromTaxon(tid); if (o) return { name: o.name, taxid: tid, via: 'NCBI taxon ' + tid, conf: true }; }
+  if (m) { const tid = m[0]; const o = await ncbiOrgFromTaxon(tid); const sp = (GDB.tax2sp && GDB.tax2sp[tid]) || (o && o.name); if (sp) return withStrain({ name: sp, taxid: tid, via: 'taxon ' + tid + (o ? ' · NCBI' : ''), conf: true }, t, null, o && o.name); }
   const norm = t.replace(/[_\-]+/g, ' ').replace(/\.(xml|json|mat|sbml)$/i, '');
-  if (/[a-z]{3,}/i.test(norm)) { const best = matchSpecies(norm, 1)[0]; if (best) return { name: best.sp, via: 'model name', conf: best.score >= 60 }; }
+  if (/[a-z]{3,}/i.test(norm)) { const best = matchSpecies(norm, 1)[0]; if (best) return withStrain({ name: best.sp, via: 'model name', conf: best.score >= 60 }, t, null, t); }
   return null;
 }
 async function detectOrganism() {
@@ -648,17 +673,18 @@ function renderValidate() {
       if (!m.length) { hits.innerHTML = `<div class="ac-empty" style="padding:10px">No GrowthDB species matches “${esc(q.value)}”. <button class="ac-btn" id="val-manual2" style="margin-left:8px">Enter my own data →</button></div>`; const mb = $('val-manual2'); if (mb) mb.onclick = () => showNoData(q.value.trim()); return; }
       m.forEach(h => { const b = el('button', 'ac-chip'); b.style.cssText = 'margin:3px 6px 3px 0;padding:6px 11px;border:1px solid var(--line);border-radius:16px;background:var(--surface-2);color:var(--ink);cursor:pointer;font-size:13px';
         b.innerHTML = `<i>${esc(h.sp)}</i> <span style="color:var(--primary-2);font-weight:600">${h.n}</span>`;
-        b.onclick = () => { _valState.sp = h.sp; showRecords(h.sp); }; hits.appendChild(b); });
+        b.onclick = () => { _valState.sp = h.sp; showRecords(h.sp, strainStd(q.value), null); }; hits.appendChild(b); });
     };
     q.oninput = () => { _valState.query = q.value; showHits(); };
     // auto-detect
     const det = await detectOrganism();
     const bn = $('val-banner');
+    const strainLine = (d) => d.sstd ? ` Target strain <b>${esc(d.strain || d.sstd)}</b> (<code>${esc(d.sstd)}</code>) — records are matched to it below.` : ` No strain designation in the model, so matching is at species level.`;
     if (!det) { bn.innerHTML = `<h3>Organism not auto-detected</h3><div class="sub">Couldn't read a strain name, assembly accession or BV-BRC id from <code>${esc(MODEL.id || '')}</code>${MODEL.name && MODEL.name !== MODEL.id ? ' / <code>' + esc(MODEL.name) + '</code>' : ''}. Type your strain in the box below.</div>`; }
     else {
       const gsp = det.conf ? speciesToGdb(det.name) : null;
-      if (det.conf && gsp) { bn.innerHTML = `<h3>✓ <i>${esc(gsp)}</i></h3><div class="sub">Detected via ${esc(det.via)}. GrowthDB has <b>${fmt((GDB.bySpecies[gsp] || []).length)}</b> measured records — loading conditions below.</div>`; _valState.sp = gsp; q.value = gsp; showRecords(gsp); }
-      else if (det.conf) { bn.innerHTML = `<h3>Detected <i>${esc(det.name)}</i></h3><div class="sub">Via ${esc(det.via)}. <b>GrowthDB has no measured growth data for this species</b>, so a database-backed validation isn't possible. You can still validate by entering your own measurements and medium.</div>`; const b = el('button', 'ac-btn primary', 'Enter my own measurements →'); b.style.marginTop = '10px'; b.onclick = () => showNoData(det.name); bn.appendChild(b); q.value = det.name; }
+      if (det.conf && gsp) { bn.innerHTML = `<h3>✓ <i>${esc(gsp)}</i>${det.sstd ? ' · strain <span style="color:var(--primary-2)">' + esc(det.strain || det.sstd) + '</span>' : ''}</h3><div class="sub">Detected via ${esc(det.via)}. GrowthDB has <b>${fmt((GDB.bySpecies[gsp] || []).length)}</b> records for this species.${strainLine(det)}</div>`; _valState.sp = gsp; q.value = det.strain ? gsp + ' ' + det.strain : gsp; showRecords(gsp, det.sstd, det.strain); }
+      else if (det.conf) { bn.innerHTML = `<h3>Detected <i>${esc(det.name)}</i>${det.sstd ? ' · strain ' + esc(det.strain || det.sstd) : ''}</h3><div class="sub">Via ${esc(det.via)}. <b>GrowthDB has no measured growth data for this species</b>, so a database-backed validation isn't possible. You can still validate by entering your own measurements and medium.</div>`; const b = el('button', 'ac-btn primary', 'Enter my own measurements →'); b.style.marginTop = '10px'; b.onclick = () => showNoData(det.name); bn.appendChild(b); q.value = det.name; }
       else { bn.innerHTML = `<h3>Best guess: <i>${esc(det.name)}</i></h3><div class="sub">Read from the model name (low confidence). Confirm below or search for a different organism.</div>`; q.value = det.name; showHits(); }
     }
     navCount('validate', '✓', 'info');
@@ -666,25 +692,41 @@ function renderValidate() {
   navCount('validate', '…', 'info');
 }
 function o2Aerobic(rec) { const o = ((rec.cond && rec.cond.o2) || '').toLowerCase(); return /aerob|oxic/.test(o) && !/anaerob|anoxic|micro/.test(o); }
-function showRecords(sp) {
+function recordRow(i, tier) {
+  const r = GDB.records[i];
+  const row = el('div', 'ac-issue sev-info'); row.style.cursor = 'default';
+  const subs = r.up.map(u => esc(u.met || u.ex)).join(', '), prods = r.sec.map(u => esc(u.met || u.ex)).join(', ');
+  const cond = [r.cond.o2, r.cond.mode, r.cond.t != null ? r.cond.t + '°C' : null, r.cond.pH != null ? 'pH ' + r.cond.pH : null].filter(Boolean).join(' · ');
+  const strainBadge = r.strain ? `<span style="display:inline-block;padding:1px 8px;border-radius:10px;font-size:10.5px;font-weight:600;color:#fff;background:${tier === 'same' ? '#15803D' : tier === 'other' ? '#64748B' : '#94A3B8'};margin-left:6px">${esc(r.strain)}${r.sstd && r.sstd !== r.strain ? '' : ''}</span>` : `<span style="display:inline-block;padding:1px 8px;border-radius:10px;font-size:10.5px;color:var(--ink-3);background:var(--surface-2);margin-left:6px">strain n/a</span>`;
+  const txt = el('div', 'txt'); txt.style.flex = '1';
+  txt.innerHTML = `<div class="ttl">${r.mu != null ? 'μ = <b>' + r.mu + '</b> h⁻¹' : (r.dt ? 'doubling ' + r.dt + ' h' : 'rates only')}${strainBadge}${r.med.name ? ' · <span style="color:var(--ink-2)">' + esc(r.med.name) + '</span>' : ''}</div>
+    <div class="note" style="font-size:12px">${cond ? esc(cond) + ' — ' : ''}${subs ? 'uptake: ' + subs + '. ' : ''}${prods ? 'secretes: ' + prods + '. ' : ''}${r.cit ? '<span style="color:var(--ink-3)">' + esc(r.cit) + '</span>' : ''}</div>`;
+  const act = el('div', ''); act.style.cssText = 'flex:none;align-self:center'; const sim = el('button', 'ac-btn primary', 'Load & edit →'); sim.style.whiteSpace = 'nowrap'; sim.onclick = () => renderCondition(conditionFromRecord(i)); act.appendChild(sim);
+  row.append(txt, act); return row;
+}
+function showRecords(sp, detTok, detStrainName) {
   const results = $('val-results'); results.innerHTML = '';
   const idxs = GDB.bySpecies[sp] || [];
   if (!idxs.length) { showNoData(sp); return; }
-  const head = el('div', 'ac-card'); head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3><div class="sub">Pick a condition to load into the editable simulator. μ is compared directly with the FBA biomass flux (both h⁻¹).</div>`;
-  const mb = el('button', 'ac-btn', '✎ Skip — enter my own condition'); mb.style.marginTop = '8px'; mb.onclick = () => showNoData(sp); head.appendChild(mb);
+  // partition by strain relative to the model's target strain
+  const same = [], other = [], nostrain = [];
+  idxs.forEach(i => { const r = GDB.records[i]; if (detTok && strainMatch(r.sstd, r.strain, detTok)) same.push(i); else if (r.strain || r.sstd) other.push(i); else nostrain.push(i); });
+  const head = el('div', 'ac-card');
+  const stTok = detTok ? `<code>${esc(detTok)}</code>` : null;
+  head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3>
+    <div class="sub">Pick a condition to load into the editable simulator. μ is compared directly with the FBA biomass flux (both h⁻¹).${detTok ? ` Records matching your strain ${stTok} are shown first.` : ' No target strain, so all records are species-level matches.'}</div>`;
+  if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — the records below are other strains or strain-unspecified, so a strain-exact validation isn't possible. Use them as a species-level guide, or enter your own strain measurements.`));
+  const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
   const list = el('div', 'ac-issues');
-  idxs.forEach(i => {
-    const r = GDB.records[i];
-    const row = el('div', 'ac-issue sev-info'); row.style.cursor = 'default';
-    const subs = r.up.map(u => esc(u.met || u.ex)).join(', '), prods = r.sec.map(u => esc(u.met || u.ex)).join(', ');
-    const cond = [r.cond.o2, r.cond.mode, r.cond.t != null ? r.cond.t + '°C' : null, r.cond.pH != null ? 'pH ' + r.cond.pH : null].filter(Boolean).join(' · ');
-    const txt = el('div', 'txt'); txt.style.flex = '1';
-    txt.innerHTML = `<div class="ttl">${r.mu != null ? 'μ = <b>' + r.mu + '</b> h⁻¹' : (r.dt ? 'doubling ' + r.dt + ' h' : 'rates only')}${r.med.name ? ' · <span style="color:var(--ink-2)">' + esc(r.med.name) + '</span>' : ''}</div>
-      <div class="note" style="font-size:12px">${cond ? esc(cond) + ' — ' : ''}${subs ? 'uptake: ' + subs + '. ' : ''}${prods ? 'secretes: ' + prods + '. ' : ''}${r.cit ? '<span style="color:var(--ink-3)">' + esc(r.cit) + '</span>' : ''}</div>`;
-    const act = el('div', 'ac-acts'); const sim = el('button', 'ac-btn primary', 'Load & edit →'); sim.onclick = () => renderCondition(conditionFromRecord(i)); act.appendChild(sim);
-    row.append(txt, act); list.appendChild(row);
-  });
+  const group = (label, arr, tier, color) => { if (!arr.length) return; const h = el('div', ''); h.style.cssText = `margin:14px 0 6px;font-size:12px;font-weight:700;color:${color};letter-spacing:.02em`; h.innerHTML = `${esc(label)} <span style="color:var(--ink-3);font-weight:500">(${arr.length})</span>`; list.appendChild(h); arr.forEach(i => list.appendChild(recordRow(i, tier))); };
+  if (detTok) {
+    group('THIS STRAIN — ' + (detStrainName || detTok), same, 'same', '#15803D');
+    group('OTHER STRAINS OF ' + sp.toUpperCase(), other, 'other', 'var(--ink-2)');
+    group('STRAIN UNSPECIFIED', nostrain, 'na', 'var(--ink-3)');
+  } else {
+    other.concat(same, nostrain).forEach(i => list.appendChild(recordRow(i, 'other')));
+  }
   results.appendChild(list);
 }
 function showNoData(name) {
@@ -710,7 +752,7 @@ function conditionFromRecord(idx) {
   if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
   if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
   rec.up.forEach(u => { if (!u.met) return; const row = add(u.met, INORG_SET.has(u.met) ? -1000 : -CARBON_UPTAKE, 'exp', { r: u.r, u: u.u }); if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u }; if (!INORG_SET.has(u.met) && row.lb >= 0) row.lb = -CARBON_UPTAKE; } });
-  return { species: rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false };
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false };
 }
 function blankCondition(species) {
   const exByMet = exIndexByMet(MODEL); const rows = [], seen = new Set();

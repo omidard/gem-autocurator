@@ -13,11 +13,40 @@ Outputs:
   docs/data/media_ex.json : {media_id: {name, aerobic, ex:[[exchange, lb, ub], ...]}}
       only the media that GrowthDB records reference (674 of 13k).
 """
-import json, os, glob
+import json, os, glob, re
 
 GDB = "/data/modelseed_cache/gdb_growth_records.json"
 MEDIA_DIR = "/data/media_curate/data/media"
 OUT = "/data/gem_autocurator/docs/data"
+
+# ---- standard strain id extraction (mirrored in autocurator.js: strainStd) ----
+_CC = r"ATCC|DSMZ|DSM|NCTC|CCUG|JCM|NBRC|IFO|CECT|LMG|CIP|NCIMB|BCRC|KCTC|NRRL|CGMCC|MCCC|PCC|UTEX|CBS|KACC|VPI|NCDO|NCFB|BCCM|KCCM"
+
+def strain_std(text):
+    """Normalise a free-text strain string to a comparable standard token, or None.
+    Priority: culture-collection accession > str./substr. designation > lab designation > K-12."""
+    if not text:
+        return None
+    t = str(text)
+    m = re.search(r"\b(" + _CC + r")\s*[-: ]?\s*(\d+[A-Za-z]?)\b", t, re.I)
+    if m:
+        return (m.group(1) + m.group(2)).upper()
+    m = re.search(r"substr\.?\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t, re.I) or re.search(r"(?:str\.?|strain)\s+([A-Za-z0-9][A-Za-z0-9\-]{1,})", t, re.I)
+    if m and re.search(r"\d", m.group(1)):
+        return re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
+    m = re.search(r"\b([A-Z]{1,4}\d{2,6}[A-Za-z]?)\b", t)
+    if m:
+        return m.group(1).upper()
+    if re.search(r"\bK-?12\b", t, re.I):
+        return "K12"
+    return None
+
+def strain_display(text):
+    if not text:
+        return None
+    # first clause before an explanatory parenthesis/comma, trimmed
+    s = re.split(r"\s*[(,]", str(text).strip())[0].strip()
+    return (s or str(text).strip())[:48]
 
 gr = json.load(open(GDB))
 
@@ -48,8 +77,12 @@ for r in gr:
     cond = r.get("conditions") or {}
     prov = r.get("provenance") or {}
     sp = r.get("gtdb_species") or r.get("species") or r.get("organism") or "unknown"
+    strain_raw = r.get("strain")
+    # fall back to a strain designation embedded in the organism name (e.g. "... str. K-12 substr. MG1655")
+    sstd = strain_std(strain_raw) or strain_std(r.get("organism"))
     rec = {
         "sp": sp, "org": r.get("organism"),
+        "strain": strain_display(strain_raw), "sstd": sstd,
         "mu": round(float(mu), 4) if mu is not None else None,
         "dt": r.get("doubling_time_h"),
         "up": up, "sec": sec,
