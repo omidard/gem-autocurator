@@ -14,8 +14,9 @@ Upload an SBML or COBRA-JSON model and the autocurator:
 
 You **supervise** every fix (approve / reject) and export a curated **SBML / JSON / MAT** (COBRA-Toolbox struct) plus a full analytical report with a Plotly dashboard.
 
-## Reference backbones (regenerate the bundled data)
-- `tools/build_id_maps.py` → `docs/data/{metabolite_map,reaction_map,bigg_met_props}.json` from BiGG + MetaNetX MNXref + KEGG/ModelSEED/ChEBI (9,403 BiGG + 35k BiGG-like metabolites; 28k BiGG + 124k BiGG-like reactions).
+## The identifier backbone — one stable id per compound/reaction
+
+`tools/build_backbone.py` ingests the full **MetaNetX (MNXref)** cross-reference universe — which already clusters every compound and reaction from BiGG · KEGG · ModelSEED · ChEBI · MetaCyc · Rhea · HMDB by **InChIKey / structure** — and keeps the GEM-relevant clusters. Each cluster is assigned **one canonical id**: its BiGG id, or (when BiGG has none) **one stable BiGG-like id shared by every database id in the cluster**, frozen in `tools/backbone_freeze.json` so it never changes between builds. Every DB id, InChIKey and synonym then maps to that one id, so `glc__D`, `C00031`, `cpd00027` and `CHEBI:4167` all resolve to `glc__D` — and nobody can introduce a discrepancy with their own id logic. Coverage: **47,930 metabolite clusters** (8,885 in BiGG + 39,045 BiGG-like) and **68,294 reaction clusters** (20,731 in BiGG + 47,563 BiGG-like). Outputs are gzipped (`docs/data/*.json.gz`, ~4.6 MB total) and decompressed in-browser. Get the MetaNetX inputs from `https://www.metanetx.org/ftp/4.4/` into `/data/mnx_tmp`. (The older `tools/build_id_maps.py` is superseded.)
 - `tools/build_thermo_pka.py` → `docs/data/{pka_table,thermo_rxn}.json` from the ModelSEED biochemistry DB (compound pKa sites; reaction reversibility + Δ<sub>r</sub>G′ᵐ).
 - `tools/build_validation.py` → `docs/data/{growthdb,media_ex}.json` from GrowthDB + the Media DB.
 

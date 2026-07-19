@@ -14,19 +14,29 @@ const APPROVED = {};   // issueId -> true/false (undefined = pending)
 try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, applyApproved }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
+async function fetchJsonGz(url) {   // GitHub Pages serves .gz raw (no Content-Encoding) -> decompress client-side
+  const r = await fetch(url); if (!r.ok) throw new Error(url);
+  const buf = new Uint8Array(await r.arrayBuffer());
+  if (buf[0] === 0x1f && buf[1] === 0x8b && typeof DecompressionStream === 'function') {   // gzip magic -> raw bytes, decompress
+    const s = new Response(buf).body.pipeThrough(new DecompressionStream('gzip'));
+    return JSON.parse(await new Response(s).text());
+  }
+  return JSON.parse(new TextDecoder().decode(buf));   // server already decompressed (Content-Encoding) or plain json
+}
 async function loadRef() {
   if (REF) return REF;
   $('ac-load').style.display = 'flex';
   const setMsg = m => { const e = $('ac-load-msg'); if (e) e.textContent = m; };
-  setMsg('Loading identifier maps (BiGG + KEGG + ModelSEED + MetaNetX)…');
-  const [met, rxn, props, pka, thermo] = await Promise.all([
-    fetch('data/metabolite_map.json').then(r => r.json()),
-    fetch('data/reaction_map.json').then(r => r.json()),
-    fetch('data/bigg_met_props.json').then(r => r.json()),
+  setMsg('Loading the identifier backbone (BiGG · KEGG · ModelSEED · MetaNetX · ChEBI · Rhea)…');
+  const [met, rxn, props, pka, thermo, cov] = await Promise.all([
+    fetchJsonGz('data/metabolite_map.json.gz'),
+    fetchJsonGz('data/reaction_map.json.gz'),
+    fetchJsonGz('data/bigg_met_props.json.gz'),
     fetch('data/pka_table.json').then(r => r.json()).catch(() => ({})),
     fetch('data/thermo_rxn.json').then(r => r.json()).catch(() => ({})),
+    fetch('data/backbone_coverage.json').then(r => r.json()).catch(() => null),
   ]);
-  REF = { met, rxn, props, pka, thermo };
+  REF = { met, rxn, props, pka, thermo, cov };
   $('ac-load').style.display = 'none';
   return REF;
 }
@@ -490,7 +500,8 @@ function drawVizIds(c) {
 
 function renderIds() {
   const s = $('stage-ids'); s.innerHTML = ''; const c = RESULT.counts;
-  s.appendChild(el('div', 'ac-sh', `<h2>Identifier mapping</h2><p>Every metabolite and reaction identifier is resolved against <b>BiGG</b> — and, when a compound or reaction exists only in KEGG / ModelSEED / MetaNetX / ChEBI / RHEA, a deterministic <b>BiGG-like</b> id so your model stays internally consistent and portable.</p>`));
+  const cov = REF.cov;
+  s.appendChild(el('div', 'ac-sh', `<h2>Identifier mapping</h2><p>Every identifier is resolved against a <b>structure-clustered backbone</b>: MetaNetX groups every compound and reaction from BiGG · KEGG · ModelSEED · ChEBI · MetaCyc · Rhea · HMDB by InChIKey, so each entity has <b>one</b> canonical id — its BiGG id, or, when BiGG has none, <b>one stable BiGG-like id shared across all its database ids</b>. Two models using <code>glc__D</code>, <code>C00031</code> or <code>cpd00027</code> all resolve to the same id.${cov ? ` The backbone spans <b>${fmt(cov.metabolites.clusters)}</b> metabolite clusters (<b>${fmt(cov.metabolites.bigg)}</b> in BiGG, <b>${fmt(cov.metabolites.bigglike)}</b> BiGG-like) and <b>${fmt(cov.reactions.clusters)}</b> reaction clusters.` : ''}</p>`));
   s.appendChild(el('div', 'ac-kpis', kpi(c.mBigg, 'metabolites → BiGG', 'ok') + kpi(c.mLike, 'metabolites → BiGG-like', 'info') + kpi(c.mGen, 'metabolites → synthesised id', c.mGen ? 'warn' : 'ok') + kpi(c.mDb, 'metabolites → unresolved DB id', c.mDb ? 'warn' : 'ok') + kpi(c.rBigg, 'reactions → BiGG', 'ok') + kpi(c.rLike, 'reactions → BiGG-like', 'info') + kpi(c.rGen, 'reactions → synthesised id', c.rGen ? 'warn' : 'ok') + kpi(c.rDb, 'reactions → unresolved DB id', c.rDb ? 'warn' : 'ok')));
   const pct = Math.round(100 * (c.mBigg + c.mLike) / Math.max(1, c.mets));
   // --- dashboard visualisation: coverage donuts + issue overview ---

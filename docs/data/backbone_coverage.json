@@ -1,0 +1,14 @@
+{
+ "metabolites": {
+  "clusters": 47930,
+  "bigg": 8885,
+  "bigglike": 39045,
+  "keys": 359921
+ },
+ "reactions": {
+  "clusters": 68294,
+  "bigg": 20731,
+  "bigglike": 47563,
+  "keys": 308080
+ }
+}
