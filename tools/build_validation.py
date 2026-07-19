@@ -97,7 +97,19 @@ for r in gr:
     species[sp] = species.get(sp, 0) + 1
 
 species_list = sorted(species.keys())
-json.dump({"species": species_list, "records": records, "tax2sp": tax2sp}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
+
+# GrowthDB-fitted maintenance (NGAM) + biomass yield (Yxs), from qS-vs-µ Pirt fits (r²>=0.6 only)
+maint = {}
+SPIDX = "/data/modelseed_cache/gdb_species_index.json"
+if os.path.exists(SPIDX):
+    sidx = json.load(open(SPIDX))
+    rows = sidx["species"] if isinstance(sidx, dict) and "species" in sidx else (sidx if isinstance(sidx, list) else list(sidx.values()))
+    for r in rows:
+        if isinstance(r, dict) and (r.get("ngam") or r.get("yxs")):
+            maint[r["s"]] = {"ngam": r.get("ngam"), "yxs": r.get("yxs")}
+
+json.dump({"species": species_list, "records": records, "tax2sp": tax2sp, "maint": maint}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
+print("maintenance fits (NGAM/Yxs): %d species" % len(maint))
 
 # media exchange compositions for referenced media
 media_ex = {}

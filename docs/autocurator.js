@@ -252,6 +252,14 @@ function findBiomass(model) {
   const pool = (bios.length ? bios : model.rxns.filter(r => !isExchange(r)));
   return pool.slice().sort((a, b) => Object.keys(b.s).length - Object.keys(a.s).length)[0] || null;
 }
+// the ATP-maintenance (NGAM) reaction: by id/name, else the atp+h2o->adp+pi(+h) hydrolysis reaction
+function findMaintenance(model) {
+  let r = model.rxns.find(x => /^(R_)?ATPM$|_ATPM$|\bNGAM\b|maintenance/i.test(x.id) || /atp\s*maintenance|non-?growth/i.test(x.name || ''));
+  if (r) return r;
+  const bg = (m) => { const x = model.mets.find(z => z.id === m); return x ? (x.canon ? x.canon.bigg : baseId(x.id)) : null; };
+  return model.rxns.find(x => { if (isExchange(x) || isBiomass(x)) return false; const b = Object.keys(x.s).map(bg); const s = new Set(b);
+    return s.has('atp') && s.has('h2o') && s.has('adp') && s.has('pi') && b.length <= 5; }) || null;
+}
 /* proton/water balancing: can the reaction be balanced by adding x H+ and y H2O? returns fix or null */
 function protonWaterFix(bal, cbal) {
   const H = bal.H || 0, O = bal.O || 0;                 // products - reactants imbalance
@@ -794,13 +802,16 @@ function conditionFromRecord(idx) {
   if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
   if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
   rec.up.forEach(u => { if (!u.met) return; const row = add(u.met, INORG_SET.has(u.met) ? -1000 : -CARBON_UPTAKE, 'exp', { r: u.r, u: u.u }); if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u }; if (!INORG_SET.has(u.met) && row.lb >= 0) row.lb = -CARBON_UPTAKE; } });
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false };
+  const mf = maintFor(rec.sp);
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
 }
+function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
 function blankCondition(species) {
   const exByMet = exIndexByMet(MODEL); const rows = [], seen = new Set();
   const add = (met, lb, src) => { const ex = exByMet[met]; if (!ex || seen.has(ex)) return; seen.add(ex); rows.push({ ex, met, name: metName(MODEL, met, ex), lb, ub: 1000, src, meas: null }); };
   INORGANIC.forEach(b => add(b, -1000, 'inorg')); add('o2', -1000, 'inorg');
-  return { species, mu: null, rows, sec: [], miss: [], cit: null, doi: null, medName: null, manual: true };
+  const mf = maintFor(species);
+  return { species, mu: null, rows, sec: [], miss: [], cit: null, doi: null, medName: null, manual: true, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
 }
 const SRC_BADGE = { exp: ['experimental', '#15803D'], medium: ['medium', '#2563EB'], inorg: ['mineral', '#64748B'], manual: ['manual', '#7C3AED'] };
 function renderCondition(cond, isManual) {
@@ -811,6 +822,13 @@ function renderCondition(cond, isManual) {
   card.innerHTML = `<h3>${cond.manual ? 'Your condition' : 'Condition'} — <i>${esc(cond.species)}</i>${cond.medName ? ' · <span style="color:var(--ink-2);font-weight:400">' + esc(cond.medName) + '</span>' : ''}</h3>
     <div class="sub">${cond.manual ? 'No GrowthDB data — enter your measured growth rate and formulate the medium by choosing exchanges and fluxes.' : 'Edit any flux before simulating. Negative = uptake (mmol gDW⁻¹ h⁻¹). Rows from measured GrowthDB rates are tagged <b>experimental</b>; medium/mineral rows are <b>pre-set (no experimental backup)</b>.'}</div>
     <div style="display:flex;align-items:center;gap:10px;margin:12px 0 6px"><label style="font-size:13px;color:var(--ink-2)">Measured μ (h⁻¹):</label><input id="val-mu" type="number" step="0.01" min="0" placeholder="unknown" value="${cond.mu == null ? '' : cond.mu}" style="width:110px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">${cond.mu == null ? '<span style="font-size:11.5px;color:var(--ink-3)">leave blank for a qualitative growth check</span>' : '<span style="font-size:11.5px;color:#15803D">experimental</span>'}</div>`;
+  // ATP maintenance (NGAM) — from GrowthDB fit or user-entered, applied to the model's ATPM reaction
+  const maintRxn = findMaintenance(MODEL);
+  const mbar = el('div', ''); mbar.style.cssText = 'display:flex;align-items:center;gap:10px;margin:2px 0 8px;flex-wrap:wrap';
+  mbar.innerHTML = `<label style="font-size:13px;color:var(--ink-2)">ATP maintenance / NGAM (mmol gDW⁻¹ h⁻¹):</label>
+    <input id="val-ngam" type="number" step="0.01" min="0" value="${cond.ngam == null ? '' : cond.ngam}" placeholder="${maintRxn ? '0' : 'n/a'}" ${maintRxn ? '' : 'disabled'} style="width:100px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">
+    <span style="font-size:11.5px;color:var(--ink-3)">${!maintRxn ? '— model has no ATP-maintenance reaction to constrain' : (cond.ngamSrc === 'growthdb' ? '<b style="color:#15803D">GrowthDB-fitted</b>' + (cond.yxs ? ` · biomass yield Yxs=${cond.yxs} gDW mmol⁻¹` : '') : 'no GrowthDB maintenance fit for this species — enter your own or leave blank') + ` · applies to <code>${esc(maintRxn.id)}</code>`}</span>`;
+  card.appendChild(mbar);
   const tbl = el('div', ''); tbl.id = 'val-tbl'; card.appendChild(tbl);
   // add-exchange control
   const addbar = el('div', ''); addbar.style.cssText = 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center';
@@ -820,7 +838,7 @@ function renderCondition(cond, isManual) {
   const addBtn = el('button', 'ac-btn', 'Add'); addBtn.onclick = () => { if (!sel.value) return; const [ex, met] = sel.value.split('|'); if (cond.rows.some(r => r.ex === ex)) { cond.rows.find(r => r.ex === ex).lb = +fluxIn.value; } else cond.rows.push({ ex, met, name: metName(MODEL, met, ex), lb: +fluxIn.value, ub: 1000, src: 'manual', meas: null }); drawTbl(); sel.value = ''; };
   addbar.append(sel, fluxIn, addBtn); card.appendChild(addbar);
   // run
-  const run = el('button', 'ac-btn primary', '▶ Run simulation'); run.style.marginTop = '14px'; run.onclick = () => { const mv = $('val-mu').value; cond.mu = mv === '' ? null : +mv; runCondition(cond); };
+  const run = el('button', 'ac-btn primary', '▶ Run simulation'); run.style.marginTop = '14px'; run.onclick = () => { const mv = $('val-mu').value; cond.mu = mv === '' ? null : +mv; const nv = $('val-ngam'); cond.ngam = (nv && nv.value !== '') ? +nv.value : null; runCondition(cond); };
   card.appendChild(run);
   const out = el('div', ''); out.id = 'val-out-wrap'; card.appendChild(out);
   results.appendChild(card);
@@ -850,6 +868,9 @@ async function runCondition(cond) {
   const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
   let carbon = false; cond.rows.forEach(row => { if (!row.ex) return; ov[row.ex] = { lb: row.lb, ub: row.ub == null ? 1000 : row.ub }; if (row.lb < -1e-9 && !INORG_SET.has(row.met)) carbon = true; });
   const boundN = cond.rows.filter(r => r.lb < -1e-9).length;
+  const maintRxn = findMaintenance(MODEL);
+  let ngamInfo = null;
+  if (cond.ngam != null && cond.ngam > 0 && maintRxn) { ov[maintRxn.id] = { lb: cond.ngam }; ngamInfo = { rxn: maintRxn.id, value: cond.ngam, src: cond.ngamSrc, yxs: cond.yxs }; }
   const card = el('div', 'ac-card'); card.id = 'val-out'; card.style.marginTop = '14px';
   const exByMet = exIndexByMet(MODEL);
   if (!carbon) { wrap.innerHTML = ''; wrap.appendChild(card); renderValidationResult(card, cond, { predMu: 0, mediaBound: boundN, bio, secCheck: [], feasible: false, noCarbon: true }); return; }
@@ -857,7 +878,7 @@ async function runCondition(cond) {
   const predMu = Math.max(0, res.obj);
   const secCheck = cond.sec.map(p => { const rid = exByMet[p.met]; const flux = rid ? (res.vars[rid] || 0) : null; return { met: p.met, ex: rid, measured: p.r, u: p.u, predFlux: flux == null ? null : +flux.toFixed(3), secreted: flux != null && flux > 1e-6 }; });
   wrap.innerHTML = ''; wrap.appendChild(card);
-  renderValidationResult(card, cond, { predMu, mediaBound: boundN, bio, secCheck, feasible: res.obj > 1e-6 });
+  renderValidationResult(card, cond, { predMu, mediaBound: boundN, bio, secCheck, feasible: res.obj > 1e-6, ngam: ngamInfo });
   navCount('validate', '✓', predMu > 1e-6 ? 'ok' : 'warn');
 }
 function renderValidationResult(card, rec, R) {
@@ -885,6 +906,7 @@ function renderValidationResult(card, rec, R) {
   card.appendChild(chip);
   const plot = el('div', 'ac-plot'); plot.id = 'val-plot'; plot.style.height = '230px'; card.appendChild(plot);
   card.appendChild(el('div', 'ac-interp', vtext));
+  if (R.ngam) card.appendChild(el('div', '', `<div style="font-size:12px;color:var(--ink-2);margin-top:8px;padding:8px 10px;background:var(--surface-2);border-radius:8px">⚙ <b>ATP maintenance applied.</b> NGAM constrained to <b>${R.ngam.value}</b> mmol gDW⁻¹ h⁻¹ on <code>${esc(R.ngam.rxn)}</code> (${R.ngam.src === 'growthdb' ? 'GrowthDB-fitted' : 'your value'}${R.ngam.yxs ? `, biomass yield Yxs=${R.ngam.yxs}` : ''}). This burns ATP that would otherwise drive growth, so the predicted μ is the maintenance-corrected maximum — closer to the real rate than the unconstrained theoretical maximum.</div>`));
   if (secTot) {
     const st = el('div', ''); st.style.marginTop = '10px';
     st.innerHTML = '<div style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px"><b>Secretion pattern</b> (does the model route flux to each measured by-product?):</div>' +
