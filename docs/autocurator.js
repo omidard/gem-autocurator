@@ -138,6 +138,7 @@ function canonMet(m) {
   if (!hit) { const d = dbIdOf(base, DBID_MET); if (d) hit = M[d.ns + ':' + d.id]; }   // id is itself a DB id (KEGG/SEED/MNX/ChEBI/InChIKey)
   if (!hit) for (const [ns, v] of Object.entries(m.anno || {})) { hit = M[ns + ':' + v] || (ns === 'chebi' ? M['chebi:' + String(v).replace(/^CHEBI:?/i, '')] : null); if (hit) break; }
   if (!hit && m.anno && m.anno.inchikey) hit = M['inchikey:' + m.anno.inchikey];   // full InChIKey = exact chemical identity
+  if (!hit) { const cp = base.replace(/_copy\d*$/i, ''); if (cp !== base) hit = M['bigg:' + cp]; }   // "_copy2" duplicate suffix
   if (!hit && m.name) hit = M['name:' + m.name.toLowerCase().replace(/[^a-z0-9]/g, '')];
   return hit || null;
 }
@@ -147,6 +148,7 @@ function canonRxn(r) {
   if (!hit) hit = R['old:' + base];
   if (!hit) { const d = dbIdOf(base, DBID_RXN); if (d) hit = R[d.ns + ':' + d.id]; }
   if (!hit) for (const [ns, v] of Object.entries(r.anno || {})) { hit = R[ns + ':' + v]; if (hit) break; }
+  if (!hit) { const cp = base.replace(/_copy\d*$/i, ''); if (cp !== base) hit = R['bigg:' + cp] || R['old:' + cp]; }   // "_copy2" duplicate suffix
   return hit || null;
 }
 // strongest available chemical identity for merging duplicates (compartment handled separately)
@@ -367,20 +369,39 @@ function curate(model) {
   const dup = {};
   model.mets.forEach(m => { const ik = identityKey(m); if (!ik) return; const key = ik + '@@' + m.compartment; (dup[key] = dup[key] || []).push(m); });
   const discrep = [];
+  const byId = {}; model.mets.forEach(m => { byId[m.id] = m; });
   Object.values(dup).forEach(arr => { if (arr.length < 2) return;
     const comp = arr[0].compartment;
     const target = (arr.map(m => m.canon).find(c => c && c.biggr) || arr[0].canon).bigg;   // prefer a real BiGG id as the merge target
     const into = target + '_' + comp;
+    const forms = new Set(arr.map(m => (m.formula || '').replace(/\s/g, '')).filter(Boolean));
+    const charges = new Set(arr.map(m => m.charge).filter(c => c != null));
+    const conflict = forms.size > 1 || charges.size > 1;
+    const caveat = conflict ? ` ⚠ Their formula/charge annotations disagree (${[...forms].join(' vs ') || 'formula'}${charges.size > 1 ? '; charge ' + [...charges].join(' vs ') : ''}) — the merge keeps one; verify it is the correct compound.` : '';
     discrep.push({ id: 'dupm_' + into, cat: 'discrep', sev: 'bad', kind: 'dupmet',
       title: `${arr.length} metabolites are the same compound`, ids: arr.map(m => m.id), to: into,
-      note: `<code>${arr.map(m => esc(m.id)).join('</code>, <code>')}</code> are the same species in compartment <b>${esc(comp)}</b> (matched by ${arr.some(m => m.anno && m.anno.inchikey) ? 'InChIKey' : 'shared identifier'}) → merge to <span class="to">${esc(into)}</span>.`,
+      note: `<code>${arr.map(m => esc(m.id)).join('</code>, <code>')}</code> are the same species in compartment <b>${esc(comp)}</b> (matched by ${arr.some(m => m.anno && m.anno.inchikey) ? 'InChIKey' : 'shared identifier'}) → merge to <span class="to">${esc(into)}</span>.${caveat}`,
       apply: { merge: arr.map(m => m.id), into } });
   });
+  // reaction signature over CANONICAL metabolite ids (+ compartment); direction-normalised
+  const rxnSig = (r, sign) => Object.entries(r.s).map(([mid, c]) => { const m = byId[mid]; const cm = (m && m.canon) ? m.canon.bigg + '_' + m.compartment : baseId(mid); return cm + ':' + (sign * c); }).sort().join('|');
   const rdup = {};
   model.rxns.forEach(r => { if (!r.canon || r.canon.exch || r.canon.generated === 'name') return; (rdup[r.canon.bigg] = rdup[r.canon.bigg] || []).push(r); });
-  Object.entries(rdup).forEach(([b, arr]) => { if (arr.length > 1) discrep.push({ id: 'dupr_' + b, cat: 'discrep', sev: 'bad', kind: 'duprxn',
-    title: `${arr.length} reactions collapse to one`, ids: arr.map(r => r.id), to: b,
-    note: `<code>${arr.map(r => esc(r.id)).join('</code>, <code>')}</code> all resolve to <span class="to">${esc(b)}</span> — duplicate reactions.`, apply: { mergeRxn: arr.map(r => r.id), into: b } }); });
+  Object.entries(rdup).forEach(([b, arr]) => { if (arr.length < 2) return;
+    const idsCode = '<code>' + arr.map(r => esc(r.id)).join('</code>, <code>') + '</code>';
+    const s0 = rxnSig(arr[0], 1);
+    const identical = arr.every(r => rxnSig(r, 1) === s0 || rxnSig(r, -1) === s0);   // same stoichiometry (allowing reversed direction)
+    if (identical) {
+      discrep.push({ id: 'dupr_' + b, cat: 'discrep', sev: 'bad', kind: 'duprxn',
+        title: `${arr.length} identical reactions → one`, ids: arr.map(r => r.id), to: b,
+        note: `${idsCode} resolve to <span class="to">${esc(b)}</span> and have <b>identical stoichiometry</b> (same substrates → products) — true duplicates, safe to merge.`,
+        apply: { mergeRxn: arr.map(r => r.id), into: b } });
+    } else {
+      discrep.push({ id: 'rxc_' + b, cat: 'discrep', sev: 'warn', kind: 'rxnconflict', advisory: true, ids: arr.map(r => r.id), to: b,
+        title: `${arr.length} reactions share id <code>${esc(b)}</code> but their formulas differ`,
+        note: `${idsCode} map to the same BiGG id <b>${esc(b)}</b> but their reaction equations are <b>different</b> (different metabolites or stoichiometry) — these are <b>not</b> duplicates, just a name/id collision. Review each; they are <b>not</b> auto-merged.` });
+    }
+  });
 
   // --- structural QC ---
   const prod = {}, cons = {}, deg = {};
@@ -399,7 +420,7 @@ function curate(model) {
   return { idIssues, discrep, structure, orphan, massIss, chargeIss, unresolved, ph: DEFAULT_PH,
     counts: { mBigg, mLike, mGen, mDb, rBigg, rLike, rGen, rDb, mets: model.mets.length, rxns: model.rxns.length, genes: model.genes,
       exch: model.rxns.filter(isExchange).length, dead: structure.length, mass: massIss.length, charge: chargeIss.length,
-      dupMet: discrep.filter(d => d.kind === 'dupmet').length, dupRxn: discrep.filter(d => d.kind === 'duprxn').length } };
+      dupMet: discrep.filter(d => d.kind === 'dupmet').length, dupRxn: discrep.filter(d => d.kind === 'duprxn').length, rxnConflict: discrep.filter(d => d.kind === 'rxnconflict').length } };
 }
 function parseFormula(f) {
   const out = {}; if (!f || /[^A-Za-z0-9().]/.test(f.replace(/\s/g, ''))) { }
@@ -426,6 +447,7 @@ function issueRow(iss) {
   let fix = iss.note || '';
   if (iss.from && iss.to) fix = `<span class="from">${esc(iss.from)}</span> → <span class="to">${esc(iss.to)}</span> — ${esc(iss.note || '')}`;
   txt.appendChild(el('div', 'fix', fix));
+  if (iss.advisory) { row.append(txt); return row; }   // review-only finding: no approve/reject / no auto-apply
   const acts = el('div', 'ac-acts');
   const yes = el('button', 'yes', '✓'); const no = el('button', 'no', '✕');
   yes.title = 'Approve fix'; no.title = 'Reject';
@@ -501,7 +523,7 @@ function renderDiscrep() {
   const s = $('stage-discrep'); s.innerHTML = '';
   s.appendChild(el('div', 'ac-sh', `<h2>Discrepancies</h2><p>The most consequential curation: when two different identifiers in your model refer to the <b>same</b> compound or reaction. Left uncurated, these split flux, break mass balance and inflate the network. Each is resolved to one canonical entity.</p>`));
   const c = RESULT.counts;
-  s.appendChild(el('div', 'ac-kpis', kpi(c.dupMet, 'duplicate metabolites', c.dupMet ? 'bad' : 'ok') + kpi(c.dupRxn, 'duplicate reactions', c.dupRxn ? 'bad' : 'ok') + kpi(c.mDb + c.rDb, 'unresolved DB ids', (c.mDb + c.rDb) ? 'warn' : 'ok')));
+  s.appendChild(el('div', 'ac-kpis', kpi(c.dupMet, 'duplicate metabolites', c.dupMet ? 'bad' : 'ok') + kpi(c.dupRxn, 'identical reactions', c.dupRxn ? 'bad' : 'ok') + kpi(c.rxnConflict || 0, 'id conflicts (review)', c.rxnConflict ? 'warn' : 'ok') + kpi(c.mDb + c.rDb, 'unresolved DB ids', (c.mDb + c.rDb) ? 'warn' : 'ok')));
   const card = el('div', 'ac-card'); card.appendChild(el('h3', '', 'Duplicate entities to merge'));
   card.appendChild(el('div', 'sub', 'Approve to merge the listed ids into the single canonical id in the exported model.'));
   issueList(card, RESULT.discrep, 'No two identifiers collapse to the same entity — your namespace is clean.');
@@ -754,30 +776,56 @@ function recordRow(i, tier) {
   const act = el('div', ''); act.style.cssText = 'flex:none;align-self:center'; const sim = el('button', 'ac-btn primary', 'Load & edit →'); sim.style.whiteSpace = 'nowrap'; sim.onclick = () => renderCondition(conditionFromRecord(i)); act.appendChild(sim);
   row.append(txt, act); return row;
 }
+function recText(i) { const r = GDB.records[i]; return [r.strain || '', (r.med && r.med.name) || '', r.up.map(u => u.met).join(' '), r.sec.map(u => u.met).join(' '), r.cit || '', r.cond.o2 || '', r.cond.mode || ''].join(' ').toLowerCase(); }
+const PAGE = 25;
 function showRecords(sp, detTok, detStrainName) {
   const results = $('val-results'); results.innerHTML = '';
   const idxs = GDB.bySpecies[sp] || [];
   if (!idxs.length) { showNoData(sp); return; }
-  // partition by strain relative to the model's target strain
   const same = [], other = [], nostrain = [];
   idxs.forEach(i => { const r = GDB.records[i]; if (detTok && strainMatch(r.sstd, r.strain, detTok)) same.push(i); else if (r.strain || r.sstd) other.push(i); else nostrain.push(i); });
   const head = el('div', 'ac-card');
-  const stTok = detTok ? `<code>${esc(detTok)}</code>` : null;
   head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3>
-    <div class="sub">Pick a condition to load into the editable simulator. μ is compared directly with the FBA biomass flux (both h⁻¹).${detTok ? ` Records matching your strain ${stTok} are shown first.` : ' No target strain, so all records are species-level matches.'}</div>`;
-  if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — the records below are other strains or strain-unspecified, so a strain-exact validation isn't possible. Use them as a species-level guide, or enter your own strain measurements.`));
+    <div class="sub">Pick a condition to load into the editable simulator.${detTok ? ` Records for strain <code>${esc(detTok)}</code> are grouped first; other strains are collapsed below.` : ''}</div>
+    <input id="val-recq" type="text" placeholder="🔎 Filter by strain, medium, substrate or citation…" style="width:100%;margin-top:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);font-size:13px">`;
+  if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — a strain-exact validation isn't possible. Use the other-strain records below as a species-level guide, or enter your own.`));
   const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
-  const list = el('div', 'ac-issues');
-  const group = (label, arr, tier, color) => { if (!arr.length) return; const h = el('div', ''); h.style.cssText = `margin:14px 0 6px;font-size:12px;font-weight:700;color:${color};letter-spacing:.02em`; h.innerHTML = `${esc(label)} <span style="color:var(--ink-3);font-weight:500">(${arr.length})</span>`; list.appendChild(h); arr.forEach(i => list.appendChild(recordRow(i, tier))); };
+  const wrap = el('div', ''); results.appendChild(wrap);
+  const state = { q: '' }; const renderers = [];
+  const addGroup = (label, arr, tier, color, open) => {
+    if (!arr.length) return;
+    const card = el('div', 'ac-card'); card.style.marginTop = '12px';
+    const hdr = el('div', ''); hdr.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none';
+    const chev = el('span', '', '▸'); chev.style.cssText = 'color:var(--ink-3);font-size:12px;width:12px';
+    const title = el('div', ''); title.style.cssText = `font-size:13px;font-weight:700;color:${color};flex:1;letter-spacing:.02em`;
+    hdr.append(chev, title); card.appendChild(hdr);
+    const body = el('div', ''); body.style.marginTop = '10px'; card.appendChild(body);
+    let expanded = open, page = PAGE;
+    const render = () => {
+      const q = state.q; const filt = q ? arr.filter(i => recText(i).includes(q)) : arr;
+      const eff = q ? filt.length > 0 : expanded;   // filtering auto-reveals matching groups
+      title.innerHTML = `${esc(label)} <span style="color:var(--ink-3);font-weight:500">(${filt.length}${q && filt.length !== arr.length ? ' of ' + arr.length : ''})</span>`;
+      chev.textContent = eff ? '▾' : '▸';
+      if (!eff) { body.style.display = 'none'; return; }
+      body.style.display = ''; body.innerHTML = '';
+      const shown = filt.slice(0, page);
+      const l = el('div', 'ac-issues'); shown.forEach(i => l.appendChild(recordRow(i, tier))); body.appendChild(l);
+      if (filt.length > page) { const more = el('button', 'ac-btn', `Show ${Math.min(PAGE, filt.length - page)} more · ${filt.length - page} remaining`); more.style.marginTop = '10px'; more.onclick = () => { page += PAGE; render(); }; body.appendChild(more); }
+      if (!filt.length) body.appendChild(el('div', 'ac-empty', 'Nothing matches the filter here.'));
+    };
+    hdr.onclick = () => { if (state.q) return; expanded = !expanded; page = PAGE; render(); };
+    renderers.push(render); wrap.appendChild(card); render();
+  };
   if (detTok) {
-    group('THIS STRAIN — ' + (detStrainName || detTok), same, 'same', '#15803D');
-    group('OTHER STRAINS OF ' + sp.toUpperCase(), other, 'other', 'var(--ink-2)');
-    group('STRAIN UNSPECIFIED', nostrain, 'na', 'var(--ink-3)');
+    addGroup('THIS STRAIN — ' + (detStrainName || detTok), same, 'same', '#15803D', true);
+    addGroup('OTHER STRAINS OF ' + sp.toUpperCase(), other, 'other', 'var(--ink-2)', false);
+    addGroup('STRAIN UNSPECIFIED', nostrain, 'na', 'var(--ink-3)', false);
   } else {
-    other.concat(same, nostrain).forEach(i => list.appendChild(recordRow(i, 'other')));
+    addGroup('ALL RECORDS', other.concat(same, nostrain), 'other', 'var(--ink-2)', true);
   }
-  results.appendChild(list);
+  const q = $('val-recq'); let t = null;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(() => { state.q = q.value.trim().toLowerCase(); renderers.forEach(g => g()); }, 150); };
 }
 function showNoData(name) {
   const results = $('val-results'); results.innerHTML = '';
