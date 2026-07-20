@@ -11,7 +11,7 @@ let REF = null;        // {met, rxn, props}
 let MODEL = null;      // parsed model
 let RESULT = null;     // curation result {ids, discrep, structure, charge}
 const APPROVED = {};   // issueId -> true/false (undefined = pending)
-try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
+try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, exportJson, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
 async function fetchJsonGz(url) {   // GitHub Pages serves .gz raw (no Content-Encoding) -> decompress client-side
@@ -37,6 +37,12 @@ async function loadRef() {
     fetch('data/backbone_coverage.json').then(r => r.json()).catch(() => null),
   ]);
   REF = { met, rxn, props, pka, thermo, cov };
+  // canonical-id sets: every id the backbone HANDS OUT (real BiGG + clustered BiGG-like). A model that
+  // already uses a canonical id must map to itself, so re-curating a curated model changes nothing
+  // (idempotency) — without this, a synthesised BiGG-like id (e.g. cycldi35gnyl) isn't a lookup key and
+  // gets re-synthesised from a leftover DB-id name, flipping cycldi35gnyl -> c16463 on reload.
+  REF.metCanon = new Set(); for (const v of Object.values(met)) if (v && v.bigg) REF.metCanon.add(v.bigg);
+  REF.rxnCanon = new Set(); for (const v of Object.values(rxn)) if (v && v.bigg) REF.rxnCanon.add(v.bigg);
   $('ac-load').style.display = 'none';
   return REF;
 }
@@ -158,6 +164,7 @@ function nsKey(ns, v) { v = String(v); if (ns === 'kegg' || ns === 'mnx' || ns =
 function canonMet(m) {
   const M = REF.met; const base = baseId(m.id);
   let hit = M['bigg:' + base];                                       // direct BiGG id
+  if (!hit && REF.metCanon.has(base)) return { bigg: base, biggr: false, generated: false };   // already a canonical BiGG-like id -> map to itself (idempotent)
   if (!hit) { const d = dbIdOf(base, DBID_MET); if (d) hit = M[d.ns + ':' + d.id]; }   // id is itself a DB id (KEGG/SEED/MNX/ChEBI/InChIKey)
   if (!hit) for (const [ns, v] of Object.entries(m.anno || {})) { hit = M[nsKey(ns, v)]; if (hit) break; }
   if (!hit && m.anno && m.anno.inchikey) hit = M['inchikey:' + m.anno.inchikey.toUpperCase()];   // full InChIKey = exact chemical identity
@@ -168,6 +175,7 @@ function canonMet(m) {
 function canonRxn(r) {
   const R = REF.rxn; const base = baseId(r.id);
   let hit = R['bigg:' + base];
+  if (!hit && REF.rxnCanon.has(base)) return { bigg: base, biggr: false, generated: false };   // already a canonical BiGG-like id -> map to itself (idempotent)
   if (!hit) hit = R['old:' + base];
   if (!hit) { const d = dbIdOf(base, DBID_RXN); if (d) hit = R[d.ns + ':' + d.id]; }
   if (!hit) for (const [ns, v] of Object.entries(r.anno || {})) { hit = R[nsKey(ns, v)]; if (hit) break; }
@@ -379,8 +387,8 @@ function curate(model) {
     if (db) { rDb++; unresolved.push({ id: r.id, base, ns: db.ns, kind: 'rxn', like }); } else rGen++; });
   const idIssues = [];
   const dbn = (c) => DBNS_NAME[c.dbns] || c.dbns;
-  const noteMet = (c) => c.biggr ? 'canonical BiGG id' : c.generated === 'dbmiss' ? `BiGG-like id — the id is a valid ${dbn(c)} id but that compound is not in MetaNetX, so it was given a stable placeholder BiGG-like id` : 'BiGG-like id synthesised from the metabolite name (compound not in the backbone)';
-  const noteRxn = (c) => c.biggr ? 'canonical BiGG reaction id' : c.generated === 'dbmiss' ? `BiGG-like id — the id is a valid ${dbn(c)} id but that reaction is not in MetaNetX, so it was given a stable placeholder BiGG-like id` : 'BiGG-like id synthesised from the reaction name (reaction not in the backbone)';
+  const noteMet = (c) => c.biggr ? 'canonical BiGG id' : c.generated === 'dbmiss' ? `BiGG-like id — the id is a valid ${dbn(c)} id but that compound is not in MetaNetX, so it was given a stable placeholder BiGG-like id` : c.generated === 'name' ? 'BiGG-like id synthesised from the metabolite name (compound not in the backbone)' : 'canonical BiGG-like id — one stable id shared across this compound\'s database ids via MetaNetX (BiGG has none)';
+  const noteRxn = (c) => c.biggr ? 'canonical BiGG reaction id' : c.generated === 'dbmiss' ? `BiGG-like id — the id is a valid ${dbn(c)} id but that reaction is not in MetaNetX, so it was given a stable placeholder BiGG-like id` : c.generated === 'name' ? 'BiGG-like id synthesised from the reaction name (reaction not in the backbone)' : 'canonical BiGG-like id — one stable id shared across this reaction\'s database ids via MetaNetX (BiGG has none)';
   // every metabolite/reaction has a canonical id; show a rename wherever it differs from the model's id
   model.mets.forEach(m => { if (m.canon && !m.canon.exch && m.canon.bigg !== baseId(m.id)) idIssues.push({ id: 'mid_' + m.id, cat: 'ids', sev: m.canon.biggr ? 'info' : 'warn', kind: 'met', generated: !!m.canon.generated,
     title: `Metabolite <code>${esc(m.id)}</code>`, from: baseId(m.id), to: m.canon.bigg + '_' + m.compartment, biggr: m.canon.biggr,
