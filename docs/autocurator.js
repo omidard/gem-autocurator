@@ -819,6 +819,7 @@ function showRecords(sp, detTok, detStrainName) {
   if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — a strain-exact validation isn't possible. Use the other-strain records below as a species-level guide, or enter your own.`));
   const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
+  renderCoveragePanel(results, sp, detTok, detStrainName);        // per-strain validation-resource map
   renderSpectrumPanel(results, sp, detTok);                       // grows-on-X confusion-matrix validation
   const wrap = el('div', ''); results.appendChild(wrap);
   const state = { q: '' }; const renderers = [];
@@ -1074,6 +1075,38 @@ function renderSpectrumResult(host, sp, R) {
     if (arr.length > 60) c.appendChild(el('div', 'sub', `…and ${arr.length - 60} more.`)); host.appendChild(c); };
   list(`False negatives — model can't grow but the organism does (${R.fn.length})`, R.fn, 'The strongest curation targets: a missing transporter or biosynthetic/catabolic pathway blocks growth on these. Gap-fill candidates.', '#DC2626');
   list(`False positives — model grows but the organism doesn't (${R.fp.length})`, R.fp, 'The model is over-permissive on these: a missing regulatory constraint, an erroneous reaction, or a gap-fill that shouldn\'t be there.', '#B45309');
+}
+function validationCoverage(sp, detTok) {
+  const idxs = GDB.bySpecies[sp] || [];
+  let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0;
+  idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok);
+    if (hit) strainRecs++;
+    if (r.mu != null && r.mu_ok !== false) { mu++; if (hit) muStrain++; }
+    if ((r.up || []).concat(r.sec || []).some(x => x.fu)) flux++;
+    if (r.med && (r.med.id || (r.med.ex && r.med.ex.length))) media++;
+  });
+  const spec = spectrumFor(sp, detTok); const maint = maintFor(sp);
+  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media,
+    specPos: spec ? spec.pos.size : 0, specNeg: spec ? spec.neg.size : 0, specStrain: spec ? spec.strainN : 0, maint: !!maint };
+}
+function renderCoveragePanel(host, sp, detTok, detStrainName) {
+  const c = validationCoverage(sp, detTok);
+  const card = el('div', 'ac-card'); card.style.cssText = 'margin-top:12px';
+  card.appendChild(el('h3', '', `Validation resources — <i>${esc(sp)}</i>${detTok ? ' · strain <span style="color:var(--primary-2)">' + esc(detStrainName || detTok) + '</span>' : ''}`));
+  card.appendChild(el('div', 'sub', 'What GrowthDB can validate for this organism. Coverage differs by strain — strain-specific evidence is the most reliable; species-level fills the gaps at lower confidence.'));
+  card.appendChild(el('div', 'ac-kpis',
+    kpi(c.mu, 'growth-rate (µ) conditions', c.mu ? 'ok' : 'warn') +
+    kpi(detTok ? c.muStrain : '—', 'of them strain-specific', c.muStrain ? 'ok' : 'info') +
+    kpi(c.flux, 'flux-usable rate conditions', c.flux ? 'ok' : 'info') +
+    kpi(c.media, 'GEM-ready media', c.media ? 'ok' : 'warn') +
+    kpi(c.specPos + c.specNeg, 'substrate spectrum calls', (c.specPos + c.specNeg) ? 'ok' : 'warn') +
+    kpi(detTok ? c.specStrain : '—', 'strain-specific substrates', c.specStrain ? 'ok' : 'info') +
+    kpi(c.maint ? 'yes' : 'no', 'GrowthDB NGAM/yield fit', c.maint ? 'ok' : 'info')));
+  const avail = [];
+  if (c.mu) avail.push('<b>growth-rate</b> (µ vs FBA)'); if (c.flux) avail.push('<b>uptake/secretion flux</b>');
+  if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)'); if (c.maint) avail.push('<b>maintenance/yield</b>');
+  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence); only the ${c.specStrain} strain-specific substrate calls are strain-exact.` : ''}`));
+  host.appendChild(card);
 }
 function renderSpectrumPanel(host, sp, detTok) {
   const spec = spectrumFor(sp, detTok);
