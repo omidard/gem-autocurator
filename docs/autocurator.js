@@ -876,9 +876,14 @@ function conditionFromRecord(idx) {
   INORGANIC.forEach(b => add(b, -1000, 'inorg'));
   if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
   if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
-  rec.up.forEach(u => { if (!u.met) return; const row = add(u.met, INORG_SET.has(u.met) ? -1000 : -CARBON_UPTAKE, 'exp', { r: u.r, u: u.u }); if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u }; if (!INORG_SET.has(u.met) && row.lb >= 0) row.lb = -CARBON_UPTAKE; } });
+  rec.up.forEach(u => { if (!u.met) return;
+    // a flux-usable (biomass-specific mmol/gDW/h) uptake rate is a REAL bound; otherwise normalise to -10
+    const usable = u.fu && u.r < 0;
+    const lb = INORG_SET.has(u.met) ? -1000 : (usable ? u.r : -CARBON_UPTAKE);
+    const row = add(u.met, lb, 'exp', { r: u.r, u: u.u, fu: !!u.fu });
+    if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u, fu: !!u.fu }; if (!INORG_SET.has(u.met)) row.lb = usable ? u.r : -CARBON_UPTAKE; } });
   const mf = maintFor(rec.sp);
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
 }
 function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
 function blankCondition(species) {
@@ -896,7 +901,7 @@ function renderCondition(cond, isManual) {
   const exOpts = Object.entries(exIndexByMet(MODEL));
   card.innerHTML = `<h3>${cond.manual ? 'Your condition' : 'Condition'} — <i>${esc(cond.species)}</i>${cond.medName ? ' · <span style="color:var(--ink-2);font-weight:400">' + esc(cond.medName) + '</span>' : ''}</h3>
     <div class="sub">${cond.manual ? 'No GrowthDB data — enter your measured growth rate and formulate the medium by choosing exchanges and fluxes.' : 'Edit any flux before simulating. Negative = uptake (mmol gDW⁻¹ h⁻¹). Rows from measured GrowthDB rates are tagged <b>experimental</b>; medium/mineral rows are <b>pre-set (no experimental backup)</b>.'}</div>
-    <div style="display:flex;align-items:center;gap:10px;margin:12px 0 6px"><label style="font-size:13px;color:var(--ink-2)">Measured μ (h⁻¹):</label><input id="val-mu" type="number" step="0.01" min="0" placeholder="unknown" value="${cond.mu == null ? '' : cond.mu}" style="width:110px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">${cond.mu == null ? '<span style="font-size:11.5px;color:var(--ink-3)">leave blank for a qualitative growth check</span>' : '<span style="font-size:11.5px;color:#15803D">experimental</span>'}</div>`;
+    <div style="display:flex;align-items:center;gap:10px;margin:12px 0 6px"><label style="font-size:13px;color:var(--ink-2)">Measured μ (h⁻¹):</label><input id="val-mu" type="number" step="0.01" min="0" placeholder="unknown" value="${cond.mu == null ? '' : cond.mu}" style="width:110px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">${cond.mu == null ? '<span style="font-size:11.5px;color:var(--ink-3)">leave blank for a qualitative growth check</span>' : (cond.mu_ok === false ? `<span style="font-size:11.5px;color:#B45309">⚠ GrowthDB flags this μ as <b>${esc(cond.mu_qc || 'suspect')}</b> — verify before trusting</span>` : '<span style="font-size:11.5px;color:#15803D">experimental</span>')}</div>`;
   // ATP maintenance (NGAM) — from GrowthDB fit or user-entered, applied to the model's ATPM reaction
   const maintRxn = findMaintenance(MODEL);
   const mbar = el('div', ''); mbar.style.cssText = 'display:flex;align-items:center;gap:10px;margin:2px 0 8px;flex-wrap:wrap';
@@ -922,7 +927,7 @@ function renderCondition(cond, isManual) {
     cond.rows.forEach((row, i) => {
       const r = el('div', ''); r.style.cssText = 'display:grid;grid-template-columns:1.5fr 96px 1fr 26px;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--line)';
       const badge = SRC_BADGE[row.src] || SRC_BADGE.manual;
-      const measTxt = row.src === 'exp' && row.meas ? `measured ${row.meas.r} ${esc(row.meas.u || '')}` : (row.src === 'inorg' ? 'unlimited mineral' : 'pre-set, no experimental backup');
+      const measTxt = row.src === 'exp' && row.meas ? (row.meas.fu ? `measured ${row.meas.r} ${esc(row.meas.u || '')} — specific rate, used as the bound` : `measured ${row.meas.r} ${esc(row.meas.u || '')} — not gDW-specific, normalised to −10`) : (row.src === 'inorg' ? 'unlimited mineral' : 'pre-set, no experimental backup');
       r.innerHTML = `<div style="font-size:12.5px"><code>${esc(row.met)}</code> <span style="color:var(--ink-3);font-size:11px">${esc(row.name && row.name !== row.met ? row.name : row.ex)}</span></div>
         <input type="number" step="any" value="${row.lb}" data-i="${i}" style="width:88px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--ink)">
         <div style="font-size:11.5px"><span style="display:inline-block;padding:2px 8px;border-radius:10px;color:#fff;background:${badge[1]};font-size:10.5px;font-weight:600">${badge[0]}</span> <span style="color:var(--ink-3)">${measTxt}</span></div>

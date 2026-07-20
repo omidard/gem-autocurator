@@ -58,7 +58,9 @@ def trim_rates(lst):
         ex = x.get("exchange"); r = x.get("rate")
         if not ex or r is None:
             continue
-        out.append({"ex": ex, "met": x.get("bigg_metabolite"), "r": round(float(r), 4), "u": x.get("units") or ""})
+        # fu = flux_usable: the rate is biomass-specific (mmol/gDW/h) and can be a real FBA bound
+        out.append({"ex": ex, "met": x.get("bigg_metabolite"), "r": round(float(r), 4),
+                    "u": x.get("units") or "", "fu": bool(x.get("flux_usable"))})
     return out
 
 records, species, referenced, tax2sp = [], {}, set(), {}
@@ -86,6 +88,7 @@ for r in gr:
         "sp": sp, "org": r.get("organism"),
         "strain": strain_display(strain_raw), "sstd": sstd,
         "mu": round(float(mu), 4) if mu is not None else None,
+        "mu_ok": r.get("mu_usable"), "mu_qc": r.get("mu_qc"),
         "dt": r.get("doubling_time_h"),
         "up": up, "sec": sec,
         "med": {"id": mid, "key": med.get("canonical_key"), "name": med.get("canonical_name") or med.get("description")},
