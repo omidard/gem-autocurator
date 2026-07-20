@@ -875,7 +875,9 @@ function conditionFromRecord(idx) {
   const add = (met, lb, src, meas) => { const ex = exByMet[met]; if (!ex) { if (src === 'exp') miss.push(met); return null; } if (seen.has(ex)) return rows.find(r => r.ex === ex); seen.add(ex); const row = { ex, met, name: metName(MODEL, met, ex), lb, ub: 1000, src, meas: meas || null }; rows.push(row); return row; };
   INORGANIC.forEach(b => add(b, -1000, 'inorg'));
   if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
-  if (rec.med.id && MEDIA[rec.med.id]) MEDIA[rec.med.id].ex.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
+  // medium components: a linked Media DB medium, else the exchanges GrowthDB formulated from the paper's recipe
+  const medEx = (rec.med.id && MEDIA[rec.med.id]) ? MEDIA[rec.med.id].ex : (rec.med.ex || []);
+  medEx.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
   rec.up.forEach(u => { if (!u.met) return;
     // a flux-usable (biomass-specific mmol/gDW/h) uptake rate is a REAL bound; otherwise normalise to -10
     const usable = u.fu && u.r < 0;

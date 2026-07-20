@@ -91,7 +91,10 @@ for r in gr:
         "mu_ok": r.get("mu_usable"), "mu_qc": r.get("mu_qc"),
         "dt": r.get("doubling_time_h"),
         "up": up, "sec": sec,
-        "med": {"id": mid, "key": med.get("canonical_key"), "name": med.get("canonical_name") or med.get("description")},
+        "med": {"id": mid, "key": med.get("canonical_key"), "name": med.get("canonical_name") or med.get("description"),
+                # exchanges formulated from the paper's own recipe (when the medium isn't a linked Media DB id)
+                "ex": [[e["exchange"], e["lb"]] for e in (med.get("exchanges") or [])] or None,
+                "fmt": med.get("formulation")},
         "cond": {"o2": cond.get("oxygen"), "t": cond.get("temperature_C"), "pH": cond.get("pH"),
                  "mode": cond.get("culture_mode"), "D": cond.get("dilution_rate_per_h")},
         "cit": (prov.get("citation") or "")[:180], "doi": prov.get("doi"),
