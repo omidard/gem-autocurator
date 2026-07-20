@@ -1034,20 +1034,19 @@ function spectrumFor(sp, strainTok) {
   }
   return { pos, neg, strainN };
 }
-async function runSpectrumValidation(sp, strainTok, host, aerobic) {
+// pure substrate sweep -> confusion counts (no DOM). onProg(i,n) for progress; cap limits solves.
+async function computeSpectrum(sp, strainTok, aerobic, cap, onProg) {
   const spec = spectrumFor(sp, strainTok); const bio = findBiomass(MODEL);
-  host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Sweeping substrates…</span></div>`;
-  if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot run the spectrum.</div>'; return; }
+  if (!spec || !bio) return null;
   const exByMet = exIndexByMet(MODEL);
   const obsMap = new Map();
   spec.pos.forEach(ex => obsMap.set(metOfExId(ex), 'pos'));
   spec.neg.forEach(ex => { const b = metOfExId(ex); if (!obsMap.has(b)) obsMap.set(b, 'neg'); });
-  const items = []; obsMap.forEach((obs, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs }); });
+  let items = []; obsMap.forEach((obs, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs }); });
   const notInModel = obsMap.size - items.length;
-  if (!items.length) { host.innerHTML = `<div class="ac-empty">None of the ${fmt(obsMap.size)} substrates in GrowthDB's spectrum for <i>${esc(sp)}</i> have an exchange in this model — nothing to test.</div>`; return; }
+  const capped = cap && items.length > cap; if (capped) items = items.slice(0, cap);
   const NPS = ['nh4', 'pi', 'so4'];
   let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
-  const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2);margin-top:8px'; host.innerHTML = ''; host.appendChild(prog);
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
@@ -1058,9 +1057,20 @@ async function runSpectrumValidation(sp, strainTok, host, aerobic) {
     const pred = res.obj > 1e-4, obs = it.obs === 'pos';
     if (pred && obs) TP++; else if (!pred && !obs) TN++;
     else if (pred && !obs) { FP++; fp.push(it); } else { FN++; fn.push(it); }
-    if (i % 15 === 0 || i === items.length - 1) { prog.innerHTML = `Testing substrate <b>${i + 1}/${items.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
+    if (onProg && (i % 15 === 0 || i === items.length - 1)) { onProg(i + 1, items.length); await new Promise(z => setTimeout(z, 0)); }
   }
-  renderSpectrumResult(host, sp, { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel, strainN: spec.strainN, strainTok, aerobic });
+  return { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel, obsTotal: obsMap.size, capped, strainN: spec.strainN };
+}
+function spectrumMCC(R) { const den = Math.sqrt((R.TP + R.FP) * (R.TP + R.FN) * (R.TN + R.FP) * (R.TN + R.FN)); return den ? (R.TP * R.TN - R.FP * R.FN) / den : 0; }
+async function runSpectrumValidation(sp, strainTok, host, aerobic) {
+  const spec = spectrumFor(sp, strainTok); const bio = findBiomass(MODEL);
+  host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Sweeping substrates…</span></div>`;
+  if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot run the spectrum.</div>'; return; }
+  if (!spec) { host.innerHTML = `<div class="ac-empty">No substrate spectrum in GrowthDB for <i>${esc(sp)}</i>.</div>`; return; }
+  const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2);margin-top:8px'; host.innerHTML = ''; host.appendChild(prog);
+  const R = await computeSpectrum(sp, strainTok, aerobic, 0, (i, n) => { prog.innerHTML = `Testing substrate <b>${i}/${n}</b>…`; });
+  if (!R.tested) { host.innerHTML = `<div class="ac-empty">None of the ${fmt(R.obsTotal)} substrates in GrowthDB's spectrum for <i>${esc(sp)}</i> have an exchange in this model — nothing to test.</div>`; return; }
+  renderSpectrumResult(host, sp, { ...R, strainTok, aerobic });
 }
 function renderSpectrumResult(host, sp, R) {
   const n = R.TP + R.TN + R.FP + R.FN;
@@ -1115,6 +1125,85 @@ function renderCoveragePanel(host, sp, detTok, detStrainName) {
   if (c.mu) avail.push('<b>growth-rate</b> (µ vs FBA)'); if (c.flux) avail.push('<b>uptake/secretion flux</b>');
   if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)'); if (c.maint) avail.push('<b>maintenance/yield</b>');
   card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence); only the ${c.specStrain} strain-specific substrate calls are strain-exact.` : ''}`));
+  // one-click aggregate scorecard across every validation type
+  if (avail.length) {
+    const bar = el('div', ''); bar.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap';
+    const btn = el('button', 'ac-btn primary', '◆ Score this GEM against GrowthDB');
+    const aer = el('label', ''); aer.style.cssText = 'font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:5px';
+    aer.innerHTML = '<input type="checkbox" id="score-aer" checked> assume aerobic';
+    const sc = el('div', ''); sc.id = 'score-out'; sc.style.marginTop = '12px';
+    btn.onclick = () => { btn.disabled = true; runScorecard(sp, detTok, sc, document.getElementById('score-aer').checked).finally(() => btn.disabled = false); };
+    bar.append(btn, aer); card.appendChild(bar); card.appendChild(sc);
+  }
+  host.appendChild(card);
+}
+// pure FBA of an editable condition (no DOM) — used by the aggregate scorecard
+async function solveCondition(cond) {
+  const bio = findBiomass(MODEL); if (!bio) return null;
+  const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
+  let carbon = false; cond.rows.forEach(row => { if (!row.ex) return; ov[row.ex] = { lb: row.lb, ub: row.ub == null ? 1000 : row.ub }; if (row.lb < -1e-9 && !INORG_SET.has(row.met)) carbon = true; });
+  const maintRxn = findMaintenance(MODEL);
+  if (cond.ngam != null && cond.ngam > 0 && maintRxn) ov[maintRxn.id] = { lb: cond.ngam };
+  if (!carbon) return { predMu: 0, feasible: false, noCarbon: true, res: null };
+  const res = await fba(MODEL, bio.id, ov);
+  return { predMu: Math.max(0, res.obj), feasible: res.obj > 1e-6, res };
+}
+async function runScorecard(sp, detTok, host, aerobic) {
+  host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Scoring the GEM across all validation types…</span></div>`;
+  await new Promise(r => setTimeout(r, 20));
+  const bio = findBiomass(MODEL);
+  if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot score this model.</div>'; return; }
+  const exByMet = exIndexByMet(MODEL);
+  const idxs = GDB.bySpecies[sp] || [];
+  // conditions with a usable medium (linked or formulated); strain-specific first, then cap for responsiveness
+  const withMed = idxs.filter(i => { const r = GDB.records[i]; return r.med && ((r.med.id && MEDIA[r.med.id]) || (r.med.ex && r.med.ex.length)); });
+  withMed.sort((a, b) => (detTok && strainMatch(GDB.records[b].sstd, GDB.records[b].strain, detTok) ? 1 : 0) - (detTok && strainMatch(GDB.records[a].sstd, GDB.records[a].strain, detTok) ? 1 : 0));
+  const CAP = 40; const sample = withMed.slice(0, CAP);
+  const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2)'; host.innerHTML = ''; host.appendChild(prog);
+  let feasN = 0, grow = 0; const muPairs = []; let secHit = 0, secTot = 0; let strainCond = 0;
+  for (let k = 0; k < sample.length; k++) {
+    const i = sample[k]; const cond = conditionFromRecord(i);
+    if (detTok && strainMatch(GDB.records[i].sstd, GDB.records[i].strain, detTok)) strainCond++;
+    const r = await solveCondition(cond);
+    if (r && !r.noCarbon) { feasN++; if (r.feasible) grow++;
+      if (cond.mu != null && cond.mu_ok !== false && r.feasible) muPairs.push([cond.mu, +r.predMu.toFixed(4)]);
+      cond.sec.forEach(p => { const rid = exByMet[p.met]; if (!rid) return; secTot++; const f = r.res ? (r.res.vars[rid] || 0) : 0; if (f > 1e-6) secHit++; }); }
+    if (k % 4 === 0 || k === sample.length - 1) { prog.innerHTML = `Simulating growth condition <b>${k + 1}/${sample.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
+  }
+  prog.innerHTML = 'Sweeping the substrate spectrum…'; await new Promise(z => setTimeout(z, 0));
+  const spec = await computeSpectrum(sp, detTok, aerobic, 60, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
+  renderScorecard(host, sp, detTok, {
+    feasN, grow, feasAcc: feasN ? grow / feasN : null, sampled: sample.length, withMed: withMed.length, strainCond,
+    muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec, aerobic
+  });
+}
+function renderScorecard(host, sp, detTok, S) {
+  host.innerHTML = '';
+  const dims = [];   // {label, val, cls, detail}
+  if (S.feasN) { const a = S.feasAcc; dims.push({ label: 'Growth feasibility', val: (100 * a).toFixed(0) + '%', cls: a >= 0.9 ? 'ok' : a >= 0.7 ? 'warn' : 'bad', detail: `${S.grow}/${S.feasN} should-grow conditions produce growth on their reported medium`, w: a }); }
+  if (S.muPairs.length) {
+    const ratios = S.muPairs.map(([m, p]) => m > 0 ? p / m : null).filter(x => x != null && isFinite(x));
+    ratios.sort((x, y) => x - y); const med = ratios.length ? ratios[Math.floor(ratios.length / 2)] : null;
+    const within = S.muPairs.filter(([m, p]) => m > 0 && p / m >= 0.5 && p / m <= 2).length; const frac = within / S.muPairs.length;
+    dims.push({ label: 'Growth-rate agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${S.muPairs.length} predicted µ within 2× of measured (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). FBA maximises growth, so it sets an upper bound and tends to over-predict.`, w: frac });
+  }
+  if (S.spec && S.spec.tested) { const mcc = spectrumMCC(S.spec); const norm = (mcc + 1) / 2;
+    dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ' (capped at 60 substrates)' : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm }); }
+  if (S.secTot) { const a = S.secRecall; dims.push({ label: 'Secretion recall', val: (100 * a).toFixed(0) + '%', cls: a >= 0.7 ? 'ok' : a >= 0.4 ? 'warn' : 'bad', detail: `${S.secHit}/${S.secTot} measured secretion products the model can produce under the reported condition`, w: a }); }
+  if (!dims.length) { host.appendChild(el('div', 'ac-empty', 'No validation dimension could be scored (no simulable medium and no spectrum).')); return; }
+  const overall = dims.reduce((s, d) => s + d.w, 0) / dims.length;
+  const grade = overall >= 0.85 ? ['A', 'ok'] : overall >= 0.7 ? ['B', 'ok'] : overall >= 0.55 ? ['C', 'warn'] : overall >= 0.4 ? ['D', 'warn'] : ['F', 'bad'];
+  const gcol = { ok: '#15803D', warn: '#B45309', bad: '#DC2626' }[grade[1]];
+  const card = el('div', 'ac-card'); card.style.cssText = 'border:2px solid ' + gcol + '33';
+  card.appendChild(el('h3', '', `GEM validation scorecard — <i>${esc(sp)}</i>${detTok ? ' · ' + esc(detTok) : ''}`));
+  const head = el('div', ''); head.style.cssText = 'display:flex;align-items:center;gap:16px;margin:8px 0 4px;flex-wrap:wrap';
+  head.innerHTML = `<div style="font-size:44px;font-weight:800;line-height:1;color:${gcol}">${grade[0]}</div><div style="font-size:13px;color:var(--ink-2)">Composite <b>${(100 * overall).toFixed(0)}%</b> across ${dims.length} validation dimension${dims.length > 1 ? 's' : ''}, from <b>${S.sampled}</b>${S.withMed > S.sampled ? ' of ' + S.withMed : ''} growth condition${S.sampled > 1 ? 's' : ''}${S.strainCond ? ` (${S.strainCond} strain-specific)` : ''} + the substrate spectrum. Each dimension is unweighted; the letter reflects the mean.</div>`;
+  card.appendChild(head);
+  dims.forEach(d => { const cls = { ok: '#15803D', warn: '#B45309', bad: '#DC2626' }[d.cls];
+    const row = el('div', ''); row.style.cssText = 'display:grid;grid-template-columns:180px 70px 1fr;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line)';
+    row.innerHTML = `<div style="font-size:13px;font-weight:600">${esc(d.label)}</div><div style="font-size:16px;font-weight:700;color:${cls}">${d.val}</div><div style="font-size:12px;color:var(--ink-3)">${d.detail}</div>`;
+    card.appendChild(row); });
+  card.appendChild(el('div', 'ac-interp', `A single number hides detail — open each validation below for the per-condition table, confusion matrix, and the exact false-positive / false-negative substrate lists (the actionable curation targets). ${S.withMed > S.sampled ? `Only the first ${S.sampled} conditions with a simulable medium were scored for responsiveness; ` : ''}growth-feasibility counts a condition as passing if the model grows at all on the reported medium.`));
   host.appendChild(card);
 }
 function renderSpectrumPanel(host, sp, detTok) {
