@@ -659,15 +659,16 @@ function directionalityIssues(model) {
   return out;
 }
 /* ---------------- lab validation (GrowthDB × MediaDB × FBA) ---------------- */
-let GDB = null, MEDIA = null;   // lazy-loaded bundles
+let GDB = null, MEDIA = null, SPECTRUM = null;   // lazy-loaded bundles
 const _valState = { sp: null, query: '' };
 async function loadValidation() {
   if (GDB) return;
-  const [g, m] = await Promise.all([
+  const [g, m, s] = await Promise.all([
     fetch('data/growthdb.json').then(r => r.json()).catch(() => ({ species: [], records: [] })),
     fetch('data/media_ex.json').then(r => r.json()).catch(() => ({})),
+    fetch('data/spectrum.json').then(r => r.json()).catch(() => ({})),
   ]);
-  GDB = g; MEDIA = m;
+  GDB = g; MEDIA = m; SPECTRUM = s;
   // group records by species for fast lookup
   GDB.bySpecies = {}; GDB.records.forEach((r, i) => { (GDB.bySpecies[r.sp] = GDB.bySpecies[r.sp] || []).push(i); });
 }
@@ -818,6 +819,7 @@ function showRecords(sp, detTok, detStrainName) {
   if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — a strain-exact validation isn't possible. Use the other-strain records below as a species-level guide, or enter your own.`));
   const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
+  renderSpectrumPanel(results, sp, detTok);                       // grows-on-X confusion-matrix validation
   const wrap = el('div', ''); results.appendChild(wrap);
   const state = { q: '' }; const renderers = [];
   const addGroup = (label, arr, tier, color, open) => {
@@ -1010,6 +1012,80 @@ function drawValPlot(rec, R, verdict, vcls) {
     { type: 'bar', name: 'measured', x: cats, y: meas, marker: { color: '#94A3B8' }, text: meas.map(v => v), textposition: 'outside', textfont: { size: 11 } },
     { type: 'bar', name: 'predicted', x: cats, y: predv, marker: { color: col }, text: predv.map(v => v), textposition: 'outside', textfont: { size: 11 } },
   ], { barmode: 'group', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { family: 'Fira Sans, sans-serif', size: 12, color: ink }, margin: { l: 48, r: 16, t: 30, b: 30 }, title: { text: 'Measured vs predicted growth rate', font: { size: 13 } }, legend: { orientation: 'h', y: 1.15, x: .5, xanchor: 'center' }, yaxis: { gridcolor: dark ? 'rgba(255,255,255,.08)' : '#EEF2F8', zeroline: false, rangemode: 'tozero' } }, { responsive: true, displayModeBar: false });
+}
+
+/* ---------------- substrate-utilisation spectrum validation (grows-on-X confusion matrix) ---------------- */
+function spectrumFor(sp, strainTok) {
+  const s = SPECTRUM && SPECTRUM[sp]; if (!s) return null;
+  const pos = new Set(s.p || []), neg = new Set(s.n || []);
+  let strainN = 0;
+  if (strainTok && s.s) for (const [st, exs] of Object.entries(s.s)) {
+    if (strainMatch(strainStd(st), st, strainTok)) { strainN += exs.length; exs.forEach(e => { pos.add(e); neg.delete(e); }); }
+  }
+  return { pos, neg, strainN };
+}
+async function runSpectrumValidation(sp, strainTok, host, aerobic) {
+  const spec = spectrumFor(sp, strainTok); const bio = findBiomass(MODEL);
+  host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Sweeping substrates…</span></div>`;
+  if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot run the spectrum.</div>'; return; }
+  const exByMet = exIndexByMet(MODEL);
+  const obsMap = new Map();
+  spec.pos.forEach(ex => obsMap.set(metOfExId(ex), 'pos'));
+  spec.neg.forEach(ex => { const b = metOfExId(ex); if (!obsMap.has(b)) obsMap.set(b, 'neg'); });
+  const items = []; obsMap.forEach((obs, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs }); });
+  const notInModel = obsMap.size - items.length;
+  if (!items.length) { host.innerHTML = `<div class="ac-empty">None of the ${fmt(obsMap.size)} substrates in GrowthDB's spectrum for <i>${esc(sp)}</i> have an exchange in this model — nothing to test.</div>`; return; }
+  const NPS = ['nh4', 'pi', 'so4'];
+  let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
+  const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2);margin-top:8px'; host.innerHTML = ''; host.appendChild(prog);
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
+    INORGANIC.concat(NPS).forEach(b => { const rid = exByMet[b]; if (rid) ov[rid] = { lb: -1000, ub: 1000 }; });
+    if (aerobic) { const o = exByMet['o2']; if (o) ov[o] = { lb: -1000, ub: 1000 }; }
+    ov[it.rid] = { lb: -10, ub: 1000 };                         // the one carbon source under test
+    const res = await fba(MODEL, bio.id, ov);
+    const pred = res.obj > 1e-4, obs = it.obs === 'pos';
+    if (pred && obs) TP++; else if (!pred && !obs) TN++;
+    else if (pred && !obs) { FP++; fp.push(it); } else { FN++; fn.push(it); }
+    if (i % 15 === 0 || i === items.length - 1) { prog.innerHTML = `Testing substrate <b>${i + 1}/${items.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
+  }
+  renderSpectrumResult(host, sp, { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel, strainN: spec.strainN, strainTok, aerobic });
+}
+function renderSpectrumResult(host, sp, R) {
+  const n = R.TP + R.TN + R.FP + R.FN;
+  const acc = n ? (R.TP + R.TN) / n : 0;
+  const sens = (R.TP + R.FN) ? R.TP / (R.TP + R.FN) : 0, spc = (R.TN + R.FP) ? R.TN / (R.TN + R.FP) : 0;
+  const den = Math.sqrt((R.TP + R.FP) * (R.TP + R.FN) * (R.TN + R.FP) * (R.TN + R.FN));
+  const mcc = den ? (R.TP * R.TN - R.FP * R.FN) / den : 0;
+  const mcls = mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad';
+  host.innerHTML = '';
+  host.appendChild(el('div', 'ac-kpis', kpi((100 * acc).toFixed(0) + '%', 'accuracy', acc >= 0.8 ? 'ok' : 'warn') + kpi(mcc.toFixed(2), 'MCC', mcls) + kpi((100 * sens).toFixed(0) + '%', 'sensitivity (recall)', 'info') + kpi((100 * spc).toFixed(0) + '%', 'specificity', 'info') + kpi(n, 'substrates tested', 'info')));
+  // 2x2 confusion matrix
+  const cm = el('div', ''); cm.style.cssText = 'display:grid;grid-template-columns:auto 1fr 1fr;gap:2px;max-width:420px;margin:6px 0 12px;font-size:12.5px';
+  const cell = (t, bg, cl) => `<div style="padding:8px 10px;background:${bg};color:${cl || 'var(--ink)'};border-radius:6px;text-align:center">${t}</div>`;
+  cm.innerHTML = cell('', 'transparent') + cell('<b>obs: grows</b>', 'var(--surface-2)') + cell('<b>obs: no-grow</b>', 'var(--surface-2)') +
+    cell('<b>model: grows</b>', 'var(--surface-2)') + cell(`<b>${R.TP}</b><br>true +`, '#dcfce7', '#15803D') + cell(`<b>${R.FP}</b><br>false +`, '#fef3c7', '#B45309') +
+    cell('<b>model: no-grow</b>', 'var(--surface-2)') + cell(`<b>${R.FN}</b><br>false −`, '#fee2e2', '#DC2626') + cell(`<b>${R.TN}</b><br>true −`, '#dcfce7', '#15803D');
+  host.appendChild(cm);
+  host.appendChild(el('div', 'ac-interp', `Tested <b>${R.tested}</b> substrates that have an exchange in the model${R.notInModel ? ` (${R.notInModel} more in GrowthDB's spectrum have no exchange here — a coverage gap)` : ''}. ${R.strainN ? `<b>${R.strainN}</b> calls are specific to strain <code>${esc(R.strainTok)}</code>; the rest are the species consensus.` : 'Species-level spectrum (no strain-specific calls matched).'} O₂ ${R.aerobic ? 'open (aerobic test)' : 'closed (anaerobic test)'}.`));
+  const list = (title, arr, note, color) => { if (!arr.length) return; const c = el('div', 'ac-card'); c.style.marginTop = '8px'; c.appendChild(el('h3', '', title)); c.appendChild(el('div', 'sub', note));
+    const l = el('div', ''); l.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px'; arr.slice(0, 60).forEach(x => { const s = el('span', ''); s.style.cssText = `padding:3px 9px;border-radius:12px;font-size:12px;background:var(--surface-2);border:1px solid ${color}`; s.innerHTML = `<code>${esc(x.b)}</code>`; l.appendChild(s); }); c.appendChild(l);
+    if (arr.length > 60) c.appendChild(el('div', 'sub', `…and ${arr.length - 60} more.`)); host.appendChild(c); };
+  list(`False negatives — model can't grow but the organism does (${R.fn.length})`, R.fn, 'The strongest curation targets: a missing transporter or biosynthetic/catabolic pathway blocks growth on these. Gap-fill candidates.', '#DC2626');
+  list(`False positives — model grows but the organism doesn't (${R.fp.length})`, R.fp, 'The model is over-permissive on these: a missing regulatory constraint, an erroneous reaction, or a gap-fill that shouldn\'t be there.', '#B45309');
+}
+function renderSpectrumPanel(host, sp, detTok) {
+  const spec = spectrumFor(sp, detTok);
+  const card = el('div', 'ac-card'); card.style.cssText = 'margin-top:12px;border:2px solid #dfe6f5';
+  if (!spec || (!spec.pos.size && !spec.neg.size)) { card.innerHTML = `<h3>Substrate-utilisation validation</h3><div class="sub">No grows-on/no-grow spectrum in GrowthDB for <i>${esc(sp)}</i> — can't run the substrate confusion matrix for this organism.</div>`; host.appendChild(card); return; }
+  card.innerHTML = `<h3>Substrate-utilisation validation <span class="note">— the standard GEM Biolog check</span></h3>
+    <div class="sub">Sweeps every substrate GrowthDB knows <i>${esc(sp)}</i> ${spec.strainN ? '(and strain <code>' + esc(detTok) + '</code>) ' : ''}grows / doesn't grow on (<b>${fmt(spec.pos.size)}</b> grows-on, <b>${fmt(spec.neg.size)}</b> no-grow): sets it as the sole carbon source, runs FBA, and builds a confusion matrix. False negatives = gap-fill targets; false positives = over-permissive reactions.</div>
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);margin:10px 0"><input type="checkbox" id="spec-aer" checked> aerobic (open O₂)</label>`;
+  const btn = el('button', 'ac-btn primary', '▶ Run substrate-spectrum validation'); btn.style.marginLeft = '12px';
+  const out = el('div', ''); out.style.marginTop = '12px';
+  btn.onclick = () => { btn.disabled = true; btn.textContent = 'Running…'; runSpectrumValidation(sp, detTok, out, card.querySelector('#spec-aer').checked).then(() => { btn.disabled = false; btn.textContent = '↻ Re-run'; }); };
+  card.appendChild(btn); card.appendChild(out); host.appendChild(card);
 }
 
 function renderReport() {

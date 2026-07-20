@@ -117,6 +117,46 @@ if os.path.exists(SPIDX):
 json.dump({"species": species_list, "records": records, "tax2sp": tax2sp, "maint": maint}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
 print("maintenance fits (NGAM/Yxs): %d species" % len(maint))
 
+# ---- substrate-utilisation SPECTRUM per species (for grows-on-X confusion-matrix validation) ----
+# positive-precedence: an exchange with ANY growth evidence (utilizable / carbon_growth / growth-positive
+# phenotype) is 'grows'; negatives are growth-negative phenotypes not seen positive anywhere.
+SPECIES_DIR = "/data/GrowthDB_work/data/species"
+spectrum = {}
+if os.path.isdir(SPECIES_DIR):
+    for f in glob.glob(SPECIES_DIR + "/*.json"):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        sp = d.get("species")
+        if not sp:
+            continue
+        dv = d.get("derived") or {}
+        pos, neg = set(), set()
+        by_strain = {}
+        for ex in (dv.get("utilizable_exchanges") or []):
+            pos.add(ex)
+        for r in (d.get("carbon_growth") or []):
+            ex = r.get("exchange")
+            if ex:
+                pos.add(ex)
+                st = r.get("strain")
+                if st:
+                    by_strain.setdefault(st, set()).add(ex)
+        for p in (d.get("phenotypes") or []):
+            if p.get("ptype") in ("growth", "growth+acid") and p.get("exchange"):
+                (pos if p.get("phenotype") == "positive" else neg).add(p["exchange"])
+        neg -= pos                                    # positive evidence wins a conflict
+        if pos or neg:
+            spectrum[sp] = {"p": sorted(pos), "n": sorted(neg),
+                            "s": {st: sorted(ex) for st, ex in by_strain.items() if ex}}
+with open(OUT + "/spectrum.json", "w") as fh:
+    json.dump(spectrum, fh, separators=(",", ":"))
+n_pos = sum(len(v["p"]) for v in spectrum.values())
+n_neg = sum(len(v["n"]) for v in spectrum.values())
+print("spectrum: %d species | %d grows-on + %d no-grow exchanges | %d bytes"
+      % (len(spectrum), n_pos, n_neg, os.path.getsize(OUT + "/spectrum.json")))
+
 # media exchange compositions for referenced media
 media_ex = {}
 files = {os.path.basename(f)[:-5]: f for f in glob.glob(MEDIA_DIR + "/*.json")}
