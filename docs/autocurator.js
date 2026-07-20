@@ -11,7 +11,7 @@ let REF = null;        // {met, rxn, props}
 let MODEL = null;      // parsed model
 let RESULT = null;     // curation result {ids, discrep, structure, charge}
 const APPROVED = {};   // issueId -> true/false (undefined = pending)
-try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, applyApproved }) }); } catch (e) {}  // debug/headless hook
+try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
 async function fetchJsonGz(url) {   // GitHub Pages serves .gz raw (no Content-Encoding) -> decompress client-side
@@ -874,13 +874,18 @@ function metName(model, bigg, exId) { const mid = Object.keys((model.rxns.find(r
 // build an editable condition from a GrowthDB record: inorganics + medium + measured (experimental) uptakes
 function conditionFromRecord(idx) {
   const rec = GDB.records[idx]; const exByMet = exIndexByMet(MODEL);
-  const rows = [], seen = new Set(); const miss = [];
+  const rows = [], seen = new Set(); const miss = [], medMiss = [];
   const add = (met, lb, src, meas) => { const ex = exByMet[met]; if (!ex) { if (src === 'exp') miss.push(met); return null; } if (seen.has(ex)) return rows.find(r => r.ex === ex); seen.add(ex); const row = { ex, met, name: metName(MODEL, met, ex), lb, ub: 1000, src, meas: meas || null }; rows.push(row); return row; };
   INORGANIC.forEach(b => add(b, -1000, 'inorg'));
   if (o2Aerobic(rec)) add('o2', -1000, 'inorg');
-  // medium components: a linked Media DB medium, else the exchanges GrowthDB formulated from the paper's recipe
+  // medium components: a linked Media DB medium, else the exchanges GrowthDB formulated from the paper's recipe.
+  // a medium component with no exchange in the model can't be supplied -> track it (organic OR mineral) so a
+  // no-growth verdict isn't blamed on metabolism when it's really a missing exchange.
   const medEx = (rec.med.id && MEDIA[rec.med.id]) ? MEDIA[rec.med.id].ex : (rec.med.ex || []);
-  medEx.forEach(([e]) => { const b = metOfExId(e); add(b, INORG_SET.has(b) ? -1000 : -CARBON_UPTAKE, INORG_SET.has(b) ? 'inorg' : 'medium'); });
+  let medTot = 0;
+  medEx.forEach(([e]) => { const b = metOfExId(e); const isInorg = INORG_SET.has(b); medTot++;
+    const row = add(b, isInorg ? -1000 : -CARBON_UPTAKE, isInorg ? 'inorg' : 'medium');
+    if (!row && !medMiss.includes(b)) medMiss.push(b); });
   rec.up.forEach(u => { if (!u.met) return;
     // a flux-usable (biomass-specific mmol/gDW/h) uptake rate is a REAL bound; otherwise normalise to -10
     const usable = u.fu && u.r < 0;
@@ -888,7 +893,7 @@ function conditionFromRecord(idx) {
     const row = add(u.met, lb, 'exp', { r: u.r, u: u.u, fu: !!u.fu });
     if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u, fu: !!u.fu }; if (!INORG_SET.has(u.met)) row.lb = usable ? u.r : -CARBON_UPTAKE; } });
   const mf = maintFor(rec.sp);
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
 }
 function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
 function blankCondition(species) {
@@ -944,6 +949,8 @@ function renderCondition(cond, isManual) {
   };
   drawTbl();
   if (cond.miss && cond.miss.length) card.insertBefore(el('div', '', `<div style="font-size:11.5px;color:#B45309;margin:8px 0">Note: measured substrate${cond.miss.length > 1 ? 's' : ''} <b>${cond.miss.map(esc).join(', ')}</b> ${cond.miss.length > 1 ? 'have' : 'has'} no exchange in this model and could not be bound.</div>`), tbl);
+  // medium exchange-completeness: components the medium provides but the model can't take up (a no-growth verdict here may be an exchange gap, not a real metabolic gap)
+  if (cond.medMiss && cond.medMiss.length) card.insertBefore(el('div', '', `<div style="font-size:11.5px;color:#B45309;margin:8px 0"><b>Medium incompletely represented:</b> ${cond.medHave} of ${cond.medHave + cond.medMiss.length} medium components have an exchange; the model has <b>no exchange</b> for <b>${cond.medMiss.map(esc).join(', ')}</b>. If this run predicts no growth, add the missing exchange(s)/transport before concluding it is a metabolic gap.</div>`), tbl);
 }
 async function runCondition(cond) {
   const wrap = $('val-out-wrap'); wrap.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center;margin-top:14px"><div class="ac-spin"></div><span>Solving FBA…</span></div>`;
