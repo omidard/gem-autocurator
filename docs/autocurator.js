@@ -11,7 +11,7 @@ let REF = null;        // {met, rxn, props}
 let MODEL = null;      // parsed model
 let RESULT = null;     // curation result {ids, discrep, structure, charge}
 const APPROVED = {};   // issueId -> true/false (undefined = pending)
-try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, exportJson, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
+try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, exportJson, exportSBML, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
 async function fetchJsonGz(url) {   // GitHub Pages serves .gz raw (no Content-Encoding) -> decompress client-side
@@ -373,6 +373,7 @@ function curate(model) {
   const unresolved = [];   // recognised DB ids not in the backbone -> given a placeholder BiGG-like id (never left as-is)
   let mBigg = 0, mLike = 0, mGen = 0, mDb = 0;
   model.mets.forEach(m => { const c = canonMet(m); const base = baseId(m.id);
+    const d0 = dbIdOf(base, DBID_MET); if (d0) { m.anno = m.anno || {}; if (!m.anno[d0.ns]) m.anno[d0.ns] = d0.id; }   // the id itself is a DB xref — keep it even after rename
     if (c) { m.canon = c; if (c.biggr) mBigg++; else mLike++; return; }
     const db = dbIdOf(base, DBID_MET);
     const like = mintBiggLike(m.name, base, 'met', takenMet, realHasMet);   // always mint a BiGG-like id
@@ -380,6 +381,7 @@ function curate(model) {
     if (db) { mDb++; unresolved.push({ id: m.id, base, ns: db.ns, kind: 'met', like }); } else mGen++; });
   let rBigg = 0, rLike = 0, rGen = 0, rDb = 0;
   model.rxns.forEach(r => { if (isExchange(r)) { r.canon = { bigg: baseId(r.id), biggr: true, exch: true }; return; } const c = canonRxn(r); const base = baseId(r.id);
+    const d0 = dbIdOf(base, DBID_RXN); if (d0) { r.anno = r.anno || {}; if (!r.anno[d0.ns]) r.anno[d0.ns] = d0.id; }   // the id itself is a DB xref — keep it even after rename
     if (c) { r.canon = c; if (c.biggr) rBigg++; else rLike++; return; }
     const db = dbIdOf(base, DBID_RXN);
     const like = mintBiggLike(r.name, base, 'rxn', takenRxn, realHasRxn);   // always mint a BiGG-like id
@@ -1257,7 +1259,7 @@ function renderReport() {
 
 /* ---------------- export ---------------- */
 function applyApproved(model) {
-  const m = JSON.parse(JSON.stringify({ mets: model.mets.map(x => ({ id: x.id, name: x.name, formula: x.formula, charge: x.charge, compartment: x.compartment })), rxns: model.rxns.map(r => ({ id: r.id, name: r.name, s: r.s, lb: r.lb, ub: r.ub, gpr: r.gpr })), id: model.id, name: model.name, genes: model.genes }));
+  const m = JSON.parse(JSON.stringify({ mets: model.mets.map(x => ({ id: x.id, name: x.name, formula: x.formula, charge: x.charge, compartment: x.compartment, anno: x.anno || {} })), rxns: model.rxns.map(r => ({ id: r.id, name: r.name, s: r.s, lb: r.lb, ub: r.ub, gpr: r.gpr, anno: r.anno || {} })), id: model.id, name: model.name, genes: model.genes }));
   const log = { renames: 0, merges: 0, protons: 0 };
   const rxnById = {}; m.rxns.forEach(r => { rxnById[r.id] = r; });
   // 1) proton/water balancing fixes (original ids still intact)
@@ -1283,13 +1285,40 @@ function applyApproved(model) {
   RESULT.idIssues.forEach(i => { if (APPROVED[i.id] === true && i.apply) { if (i.apply.met && !metRe[i.apply.met]) ren['m:' + i.apply.met] = i.apply.newId; if (i.apply.rxn && !drop.has(i.apply.rxn)) ren['r:' + i.apply.rxn] = i.apply.newId; log.renames++; } });
   const seenM = new Set(); m.mets = m.mets.filter(x => { const n = ren['m:' + x.id] || x.id; if (seenM.has(n)) return false; seenM.add(n); x.id = n; return true; });
   m.rxns.forEach(r => { const n = ren['r:' + r.id]; if (n) r.id = n; const ns = {}; Object.entries(r.s).forEach(([mid, c]) => { ns[ren['m:' + mid] || mid] = c; }); r.s = ns; });
+  // upgrade placeholder metabolite names (empty / == id / a bare DB id) to the backbone's chemical name
+  const PLACE = /^(C\d{4,6}|cpd\d{4,6}|MNXM\d+|CHEBI:?\d+|R\d{4,6}|rxn\d{4,6})$/i;
+  m.mets.forEach(x => { const base = baseId(x.id); const pr = REF.props[base];
+    if (pr && pr.n) { const nm = (x.name || '').trim(); if (!nm || nm === x.id || nm === base || PLACE.test(nm)) x.name = pr.n; } });
   m._log = log;
   return m;
 }
+// normalised xref dict -> COBRA-JSON annotation object (identifiers.org-style keys, values as lists)
+function annoCobra(anno, kind) {
+  if (!anno) return undefined; const o = {}; const put = (k, v) => { if (v) o[k] = [String(v)]; };
+  put(kind === 'rxn' ? 'kegg.reaction' : 'kegg.compound', anno.kegg);
+  put(kind === 'rxn' ? 'seed.reaction' : 'seed.compound', anno.seed);
+  if (anno.chebi) o.chebi = ['CHEBI:' + String(anno.chebi).replace(/^CHEBI:?/i, '')];
+  put('inchi_key', anno.inchikey);
+  put(kind === 'rxn' ? 'metanetx.reaction' : 'metanetx.chemical', anno.mnx);
+  put('rhea', anno.rhea);
+  return Object.keys(o).length ? o : undefined;
+}
+// normalised xref dict -> SBML MIRIAM bqbiol:is annotation block (empty string if none)
+function annoSBML(anno, kind, sid) {
+  if (!anno) return ''; const li = []; const add = u => li.push(`<rdf:li rdf:resource="https://identifiers.org/${u}"/>`);
+  if (anno.kegg) add((kind === 'rxn' ? 'kegg.reaction/' : 'kegg.compound/') + anno.kegg);
+  if (anno.seed) add((kind === 'rxn' ? 'seed.reaction/' : 'seed.compound/') + anno.seed);
+  if (anno.chebi) add('CHEBI:' + String(anno.chebi).replace(/^CHEBI:?/i, ''));
+  if (anno.inchikey) add('inchikey/' + anno.inchikey);
+  if (anno.mnx) add((kind === 'rxn' ? 'metanetx.reaction/' : 'metanetx.chemical/') + anno.mnx);
+  if (anno.rhea) add('rhea/' + anno.rhea);
+  if (!li.length) return '';
+  return `<annotation><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:bqbiol="http://biomodels.net/biology-qualifiers/"><rdf:Description rdf:about="#${esc(sid)}"><bqbiol:is><rdf:Bag>${li.join('')}</rdf:Bag></bqbiol:is></rdf:Description></rdf:RDF></annotation>`;
+}
 function exportJson() {
   const m = applyApproved(MODEL);
-  const out = { id: m.id, name: m.name, version: '1', metabolites: m.mets.map(x => ({ id: x.id, name: x.name, formula: x.formula || '', charge: x.charge == null ? 0 : x.charge, compartment: x.compartment })),
-    reactions: m.rxns.map(r => ({ id: r.id, name: r.name, metabolites: r.s, lower_bound: r.lb == null ? -1000 : r.lb, upper_bound: r.ub == null ? 1000 : r.ub, gene_reaction_rule: r.gpr || '' })),
+  const out = { id: m.id, name: m.name, version: '1', metabolites: m.mets.map(x => { const a = annoCobra(x.anno, 'met'); const o = { id: x.id, name: x.name, formula: x.formula || '', charge: x.charge == null ? 0 : x.charge, compartment: x.compartment }; if (a) o.annotation = a; return o; }),
+    reactions: m.rxns.map(r => { const a = annoCobra(r.anno, 'rxn'); const o = { id: r.id, name: r.name, metabolites: r.s, lower_bound: r.lb == null ? -1000 : r.lb, upper_bound: r.ub == null ? 1000 : r.ub, gene_reaction_rule: r.gpr || '' }; if (a) o.annotation = a; return o; }),
     genes: [], compartments: {}, notes: { curated_by: 'GEM Autocurator', date: new Date().toISOString().slice(0, 10) } };
   return JSON.stringify(out, null, 1);
 }
@@ -1299,8 +1328,8 @@ function exportSBML() {
   const rx = m.rxns.map(r => { const lb = bid(r.lb == null ? -1000 : r.lb), ub = bid(r.ub == null ? 1000 : r.ub);
     const reac = Object.entries(r.s).filter(([, c]) => c < 0).map(([mid, c]) => `<speciesReference species="${esc(mid)}" stoichiometry="${Math.abs(c)}" constant="true"/>`).join('');
     const prod = Object.entries(r.s).filter(([, c]) => c > 0).map(([mid, c]) => `<speciesReference species="${esc(mid)}" stoichiometry="${c}" constant="true"/>`).join('');
-    return `<reaction id="${esc(r.id)}" name="${esc(r.name)}" reversible="${r.lb < 0}" fast="false" fbc:lowerFluxBound="${lb}" fbc:upperFluxBound="${ub}"><listOfReactants>${reac}</listOfReactants><listOfProducts>${prod}</listOfProducts></reaction>`; }).join('\n');
-  const sp = m.mets.map(x => `<species id="${esc(x.id)}" name="${esc(x.name)}" compartment="${esc(x.compartment)}" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false" fbc:charge="${x.charge == null ? 0 : x.charge}" fbc:chemicalFormula="${esc(x.formula || '')}"/>`).join('\n');
+    return `<reaction id="${esc(r.id)}" name="${esc(r.name)}" reversible="${r.lb < 0}" fast="false" fbc:lowerFluxBound="${lb}" fbc:upperFluxBound="${ub}">${annoSBML(r.anno, 'rxn', r.id)}<listOfReactants>${reac}</listOfReactants><listOfProducts>${prod}</listOfProducts></reaction>`; }).join('\n');
+  const sp = m.mets.map(x => { const a = annoSBML(x.anno, 'met', x.id); const attrs = `id="${esc(x.id)}" name="${esc(x.name)}" compartment="${esc(x.compartment)}" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false" fbc:charge="${x.charge == null ? 0 : x.charge}" fbc:chemicalFormula="${esc(x.formula || '')}"`; return a ? `<species ${attrs}>${a}</species>` : `<species ${attrs}/>`; }).join('\n');
   const comps = [...new Set(m.mets.map(x => x.compartment))].map(c => `<compartment id="${esc(c)}" constant="true"/>`).join('');
   const params = [...bounds].map(([k, v]) => `<parameter id="${k}" value="${v}" constant="true"/>`).join('');
   return `<?xml version="1.0" encoding="UTF-8"?>\n<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" xmlns:fbc="http://www.sbml.org/sbml/level3/version1/fbc/version2" level="3" version="1" fbc:required="false">\n<model id="${esc(m.id)}" name="${esc(m.name)} (autocurated)" fbc:strict="true">\n<listOfCompartments>${comps}</listOfCompartments>\n<listOfParameters>${params}</listOfParameters>\n<listOfSpecies>\n${sp}\n</listOfSpecies>\n<listOfReactions>\n${rx}\n</listOfReactions>\n</model>\n</sbml>`;
@@ -1338,6 +1367,14 @@ function exportMAT() {
     ['rev', mDbl('', m.rxns.map(r => r.lb < 0 ? 1 : 0), nR, 1)],
     ['rxnNames', mCell('', m.rxns.map(r => r.name || r.id))], ['metNames', mCell('', m.mets.map(x => x.name || x.id))],
     ['metFormulas', mCell('', m.mets.map(x => x.formula || ''))], ['grRules', mCell('', m.rxns.map(r => r.gpr || ''))],
+    // preserved cross-references (COBRA-standard annotation fields)
+    ['metKEGGID', mCell('', m.mets.map(x => (x.anno && x.anno.kegg) || ''))],
+    ['metChEBIID', mCell('', m.mets.map(x => (x.anno && x.anno.chebi) ? 'CHEBI:' + String(x.anno.chebi).replace(/^CHEBI:?/i, '') : ''))],
+    ['metInChIKey', mCell('', m.mets.map(x => (x.anno && x.anno.inchikey) || ''))],
+    ['metMetaNetXID', mCell('', m.mets.map(x => (x.anno && x.anno.mnx) || ''))],
+    ['metSEEDID', mCell('', m.mets.map(x => (x.anno && x.anno.seed) || ''))],
+    ['rxnKEGGID', mCell('', m.rxns.map(r => (r.anno && r.anno.kegg) || ''))],
+    ['rxnMetaNetXID', mCell('', m.rxns.map(r => (r.anno && r.anno.mnx) || ''))],
     ['description', mChar('', (m.name || m.id || 'model') + ' — autocurated')],
   ];
   const struct = mStruct('model', fields);
