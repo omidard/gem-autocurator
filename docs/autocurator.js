@@ -1276,7 +1276,9 @@ async function runScorecard(sp, detTok, host, o2override) {
   const idxs = GDB.bySpecies[sp] || [];
   // conditions with a usable medium (linked or formulated); strain-specific first, then cap for responsiveness
   const withMed = idxs.filter(i => { const r = GDB.records[i]; return r.med && ((r.med.id && MEDIA[r.med.id]) || (r.med.ex && r.med.ex.length)); });
-  withMed.sort((a, b) => (detTok && strainMatch(GDB.records[b].sstd, GDB.records[b].strain, detTok) ? 1 : 0) - (detTok && strainMatch(GDB.records[a].sstd, GDB.records[a].strain, detTok) ? 1 : 0));
+  // prioritise the most informative conditions: yield-constrained (measured uptake) first, then strain-specific
+  const prio = i => { const r = GDB.records[i]; const flux = (r.up || []).some(x => x.fu && x.r < 0) ? 2 : 0; const strainM = detTok && strainMatch(r.sstd, r.strain, detTok) ? 1 : 0; return flux + strainM; };
+  withMed.sort((a, b) => prio(b) - prio(a));
   const CAP = 40; const sample = withMed.slice(0, CAP);
   const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2)'; host.innerHTML = ''; host.appendChild(prog);
   let feasN = 0, grow = 0; const muPairs = []; let secHit = 0, secTot = 0; let strainCond = 0;
@@ -1285,27 +1287,50 @@ async function runScorecard(sp, detTok, host, o2override) {
     if (detTok && strainMatch(GDB.records[i].sstd, GDB.records[i].strain, detTok)) strainCond++;
     const r = await solveCondition(cond);
     if (r && !r.noCarbon) { feasN++; if (r.feasible) grow++;
-      if (cond.mu != null && cond.mu_ok !== false && r.feasible) muPairs.push([cond.mu, +r.predMu.toFixed(4)]);
+      // yield-constrained = the record's own measured specific uptake bounds the carbon (predicted µ = uptake × yield, a real quantitative test)
+      const con = cond.rows.some(x => x.meas && x.meas.fu && x.lb < -1e-9);
+      if (cond.mu != null && cond.mu_ok !== false && r.feasible) muPairs.push({ m: cond.mu, p: +r.predMu.toFixed(4), con });
       cond.sec.forEach(p => { const rid = exByMet[p.met]; if (!rid) return; secTot++; const f = r.res ? (r.res.vars[rid] || 0) : 0; if (f > 1e-6) secHit++; }); }
     if (k % 4 === 0 || k === sample.length - 1) { prog.innerHTML = `Simulating growth condition <b>${k + 1}/${sample.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
+  }
+  // knockout-phenotype accuracy: simulate the wild type + each simulable KO derivative, does grow/no-grow match?
+  const koIdx = idxs.filter(i => { const r = GDB.records[i]; return r.ko && r.sim && r.med && ((r.med.id && MEDIA[r.med.id]) || (r.med.ex && r.med.ex.length)); }).slice(0, 25);
+  let koTested = 0, koMatch = 0, koApplied = 0;
+  for (let k = 0; k < koIdx.length; k++) {
+    const cond = conditionFromRecord(koIdx[k]);
+    if (!(cond.koMatched && cond.koMatched.length)) continue;     // KO gene must be in the model
+    const r = await solveCondition(cond);
+    if (!r || r.noCarbon) continue;
+    koApplied++; const obsGrow = cond.mu == null ? true : cond.mu > 1e-4;
+    koTested++; if (r.feasible === obsGrow) koMatch++;
+    if (k % 3 === 0) { prog.innerHTML = `Simulating knockout <b>${k + 1}/${koIdx.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
   }
   prog.innerHTML = 'Sweeping the substrate spectrum…'; await new Promise(z => setTimeout(z, 0));
   const spec = await computeSpectrum(sp, detTok, o2override, 90, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
   renderScorecard(host, sp, detTok, {
     feasN, grow, feasAcc: feasN ? grow / feasN : null, sampled: sample.length, withMed: withMed.length, strainCond,
-    muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec, aerobic
+    muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec,
+    koTested, koMatch, koApplied, koCand: koIdx.length
   });
 }
 function renderScorecard(host, sp, detTok, S) {
   host.innerHTML = '';
   const dims = [];   // {label, val, cls, detail}
   if (S.feasN) { const a = S.feasAcc; dims.push({ label: 'Growth feasibility', val: (100 * a).toFixed(0) + '%', cls: a >= 0.9 ? 'ok' : a >= 0.7 ? 'warn' : 'bad', detail: `${S.grow}/${S.feasN} should-grow conditions produce growth on their reported medium`, w: a }); }
-  if (S.muPairs.length) {
-    const ratios = S.muPairs.map(([m, p]) => m > 0 ? p / m : null).filter(x => x != null && isFinite(x));
-    ratios.sort((x, y) => x - y); const med = ratios.length ? ratios[Math.floor(ratios.length / 2)] : null;
-    const within = S.muPairs.filter(([m, p]) => m > 0 && p / m >= 0.5 && p / m <= 2).length; const frac = within / S.muPairs.length;
-    dims.push({ label: 'Growth-rate agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${S.muPairs.length} predicted µ within 2× of measured (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). FBA maximises growth, so it sets an upper bound and tends to over-predict.`, w: frac });
+  // growth-YIELD agreement (constrained): the measured uptake bounds the model, so predicted µ = uptake × yield —
+  // a real quantitative comparison, scored on a tighter ±30% band
+  const yieldP = S.muPairs.filter(x => x.con), maxP = S.muPairs.filter(x => !x.con);
+  const medOf = arr => { const r = arr.map(x => x.m > 0 ? x.p / x.m : null).filter(x => x != null && isFinite(x)).sort((a, b) => a - b); return r.length ? r[Math.floor(r.length / 2)] : null; };
+  if (yieldP.length) {
+    const within = yieldP.filter(x => x.m > 0 && x.p / x.m >= 0.7 && x.p / x.m <= 1.3).length; const frac = within / yieldP.length; const med = medOf(yieldP);
+    dims.push({ label: 'Growth-yield agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${yieldP.length} predicted µ within ±30% of measured when the model is constrained to the record's measured substrate uptake (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). This is the quantitative yield test — the model isn't free to over-predict.`, w: frac });
   }
+  if (maxP.length) {
+    const within = maxP.filter(x => x.m > 0 && x.p / x.m >= 0.5 && x.p / x.m <= 2).length; const frac = within / maxP.length; const med = medOf(maxP);
+    dims.push({ label: 'Max-growth µ (upper bound)', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${maxP.length} within 2× of measured (median ${med ? med.toFixed(2) : 'n/a'}×). No measured uptake, so FBA maximises growth and over-predicts by design — a loose check.`, w: frac });
+  }
+  // knockout-phenotype accuracy: does the model reproduce each mutant's grow/no-grow?
+  if (S.koTested) { const a = S.koMatch / S.koTested; dims.push({ label: 'Knockout phenotypes', val: (100 * a).toFixed(0) + '%', cls: a >= 0.8 ? 'ok' : a >= 0.6 ? 'warn' : 'bad', detail: `${S.koMatch}/${S.koTested} gene-deletion derivatives whose grow/no-grow the model reproduces (GPR knockout applied; genes present in the model).`, w: a }); }
   if (S.spec && S.spec.tested) { const mcc = spectrumMCC(S.spec); const norm = (mcc + 1) / 2;
     dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ` (${S.spec.tested}-substrate balanced sample)` : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm }); }
   if (S.secTot) { const a = S.secRecall; dims.push({ label: 'Secretion recall', val: (100 * a).toFixed(0) + '%', cls: a >= 0.7 ? 'ok' : a >= 0.4 ? 'warn' : 'bad', detail: `${S.secHit}/${S.secTot} measured secretion products the model can produce under the reported condition`, w: a }); }
@@ -1316,7 +1341,7 @@ function renderScorecard(host, sp, detTok, S) {
   const card = el('div', 'ac-card'); card.style.cssText = 'border:2px solid ' + gcol + '33';
   card.appendChild(el('h3', '', `GEM validation scorecard — <i>${esc(sp)}</i>${detTok ? ' · ' + esc(detTok) : ''}`));
   const head = el('div', ''); head.style.cssText = 'display:flex;align-items:center;gap:16px;margin:8px 0 4px;flex-wrap:wrap';
-  head.innerHTML = `<div style="font-size:44px;font-weight:800;line-height:1;color:${gcol}">${grade[0]}</div><div style="font-size:13px;color:var(--ink-2)">Composite <b>${(100 * overall).toFixed(0)}%</b> across ${dims.length} validation dimension${dims.length > 1 ? 's' : ''}, from <b>${S.sampled}</b>${S.withMed > S.sampled ? ' of ' + S.withMed : ''} growth condition${S.sampled > 1 ? 's' : ''}${S.strainCond ? ` (${S.strainCond} strain-specific)` : ''} + the substrate spectrum. Each dimension is unweighted; the letter reflects the mean.</div>`;
+  head.innerHTML = `<div style="font-size:44px;font-weight:800;line-height:1;color:${gcol}">${grade[0]}</div><div style="font-size:13px;color:var(--ink-2)">Composite <b>${(100 * overall).toFixed(0)}%</b> across ${dims.length} validation dimension${dims.length > 1 ? 's' : ''}, from <b>${S.sampled}</b>${S.withMed > S.sampled ? ' of ' + S.withMed : ''} growth condition${S.sampled > 1 ? 's' : ''}${S.strainCond ? ` (${S.strainCond} strain-specific)` : ''}${S.koTested ? `, ${S.koTested} knockout derivative${S.koTested > 1 ? 's' : ''}` : ''} + the substrate spectrum. Each dimension is unweighted; the letter reflects the mean.</div>`;
   card.appendChild(head);
   dims.forEach(d => { const cls = { ok: '#15803D', warn: '#B45309', bad: '#DC2626' }[d.cls];
     const row = el('div', ''); row.style.cssText = 'display:grid;grid-template-columns:180px 70px 1fr;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line)';
