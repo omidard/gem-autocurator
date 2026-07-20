@@ -1049,18 +1049,46 @@ function spectrumFor(sp, strainTok) {
   if (strainTok && s.s) for (const [st, exs] of Object.entries(s.s)) {
     if (strainMatch(strainStd(st), st, strainTok)) { strainN += exs.length; exs.forEach(e => { pos.add(e); neg.delete(e); }); }
   }
-  return { pos, neg, strainN };
+  return { pos, neg, strainN, o2: s.o2 || null, np: s.np || {}, nn: s.nn || {} };
 }
-// pure substrate sweep -> confusion counts (no DOM). onProg(i,n) for progress; cap limits solves.
-async function computeSpectrum(sp, strainTok, aerobic, cap, onProg) {
+// resolve whether O2 should be open: an explicit override wins, else follow the organism's lifestyle
+// (obligate anaerobes tested O2-closed; aerobe/facultative/microaerophile/unknown tested O2-open)
+function o2IsOpen(o2pref, override) { if (override === true || override === false) return override; return o2pref !== 'anaerobic'; }
+// find a carbon source the model actually grows on (needed as a background C for N/S/P role tests)
+async function findRefCarbon(sp, strainTok, o2open) {
+  const exByMet = exIndexByMet(MODEL); const bio = findBiomass(MODEL); if (!bio) return null;
+  const spec = spectrumFor(sp, strainTok);
+  const cands = ['glc__D', 'ac', 'succ', 'glyc', 'pyr'].concat([...(spec ? spec.pos : [])].map(metOfExId));
+  const seen = new Set();
+  for (const b of cands) {
+    if (seen.has(b) || !exByMet[b]) continue; seen.add(b);
+    const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
+    INORGANIC.concat(['nh4', 'pi', 'so4']).forEach(x => { const rid = exByMet[x]; if (rid) ov[rid] = { lb: -1000, ub: 1000 }; });
+    if (o2open) { const o = exByMet['o2']; if (o) ov[o] = { lb: -1000, ub: 1000 }; }
+    ov[exByMet[b]] = { lb: -10, ub: 1000 };
+    const res = await fba(MODEL, bio.id, ov);
+    if (res.obj > 1e-3) return { met: b, rid: exByMet[b] };
+  }
+  return null;
+}
+// pure substrate sweep -> confusion counts (no DOM). role: 'carbon' (sole-C test) or nitrogen/sulfur/
+// phosphorus (substrate supplies that element with a background carbon present). o2override: true/false/null.
+async function computeSpectrum(sp, strainTok, o2override, cap, onProg, opts) {
+  opts = opts || {}; const role = opts.role || 'carbon';
   const spec = spectrumFor(sp, strainTok); const bio = findBiomass(MODEL);
   if (!spec || !bio) return null;
   const exByMet = exIndexByMet(MODEL);
+  const o2open = o2IsOpen(spec.o2, o2override);
+  const posSrc = role === 'carbon' ? spec.pos : new Set(spec.np[role] || []);
+  const negSrc = role === 'carbon' ? spec.neg : new Set(spec.nn[role] || []);
   const obsMap = new Map();
-  spec.pos.forEach(ex => obsMap.set(metOfExId(ex), 'pos'));
-  spec.neg.forEach(ex => { const b = metOfExId(ex); if (!obsMap.has(b)) obsMap.set(b, 'neg'); });
+  posSrc.forEach(ex => obsMap.set(metOfExId(ex), 'pos'));
+  negSrc.forEach(ex => { const b = metOfExId(ex); if (!obsMap.has(b)) obsMap.set(b, 'neg'); });
   let items = []; obsMap.forEach((obs, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs }); });
   const notInModel = obsMap.size - items.length;
+  // for a role test we need a background carbon; without one, nothing can grow -> can't test
+  const refC = role === 'carbon' ? null : opts.refCarbon;
+  if (role !== 'carbon' && !refC) return { TP: 0, TN: 0, FP: 0, FN: 0, fp: [], fn: [], tested: 0, notInModel, obsTotal: obsMap.size, capped: false, strainN: 0, role, o2open, noRefCarbon: true };
   // cap must KEEP CLASS BALANCE: positives are inserted before negatives, so a naive first-N slice
   // takes only grows-on calls -> zero negatives -> TN=FP=0 -> MCC collapses to 0. Sample both classes.
   const capped = cap && items.length > cap;
@@ -1070,41 +1098,60 @@ async function computeSpectrum(sp, strainTok, aerobic, cap, onProg) {
     const nPos = Math.min(pos.length, cap - nNeg);
     items = pos.slice(0, nPos).concat(neg.slice(0, nNeg));
   }
-  const NPS = ['nh4', 'pi', 'so4'];
+  // withhold the mineral the substrate is meant to supply, so the substrate must provide that element
+  const withhold = { nitrogen: 'nh4', sulfur: 'so4', phosphorus: 'pi' }[role];
+  const openMin = new Set(INORGANIC.concat(['nh4', 'pi', 'so4'])); if (withhold) openMin.delete(withhold);
   let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
-    INORGANIC.concat(NPS).forEach(b => { const rid = exByMet[b]; if (rid) ov[rid] = { lb: -1000, ub: 1000 }; });
-    if (aerobic) { const o = exByMet['o2']; if (o) ov[o] = { lb: -1000, ub: 1000 }; }
-    ov[it.rid] = { lb: -10, ub: 1000 };                         // the one carbon source under test
+    openMin.forEach(b => { const rid = exByMet[b]; if (rid) ov[rid] = { lb: -1000, ub: 1000 }; });
+    if (o2open) { const o = exByMet['o2']; if (o) ov[o] = { lb: -1000, ub: 1000 }; }
+    if (refC) ov[refC.rid] = { lb: -10, ub: 1000 };             // background carbon for the role test
+    ov[it.rid] = { lb: role === 'carbon' ? -10 : -1000, ub: 1000 };   // the substrate under test (C capped; N/S/P unlimited)
     const res = await fba(MODEL, bio.id, ov);
     const pred = res.obj > 1e-4, obs = it.obs === 'pos';
     if (pred && obs) TP++; else if (!pred && !obs) TN++;
     else if (pred && !obs) { FP++; fp.push(it); } else { FN++; fn.push(it); }
     if (onProg && (i % 15 === 0 || i === items.length - 1)) { onProg(i + 1, items.length); await new Promise(z => setTimeout(z, 0)); }
   }
-  return { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel, obsTotal: obsMap.size, capped, strainN: spec.strainN };
+  return { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel, obsTotal: obsMap.size, capped, strainN: spec.strainN, role, o2open };
 }
 function spectrumMCC(R) { const den = Math.sqrt((R.TP + R.FP) * (R.TP + R.FN) * (R.TN + R.FP) * (R.TN + R.FN)); return den ? (R.TP * R.TN - R.FP * R.FN) / den : 0; }
-async function runSpectrumValidation(sp, strainTok, host, aerobic) {
+async function runSpectrumValidation(sp, strainTok, host, o2override) {
   const spec = spectrumFor(sp, strainTok); const bio = findBiomass(MODEL);
   host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Sweeping substrates…</span></div>`;
   if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot run the spectrum.</div>'; return; }
   if (!spec) { host.innerHTML = `<div class="ac-empty">No substrate spectrum in GrowthDB for <i>${esc(sp)}</i>.</div>`; return; }
   const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2);margin-top:8px'; host.innerHTML = ''; host.appendChild(prog);
-  const R = await computeSpectrum(sp, strainTok, aerobic, 0, (i, n) => { prog.innerHTML = `Testing substrate <b>${i}/${n}</b>…`; });
+  const o2open = o2IsOpen(spec.o2, o2override);
+  const R = await computeSpectrum(sp, strainTok, o2override, 0, (i, n) => { prog.innerHTML = `Testing carbon substrate <b>${i}/${n}</b>…`; });
   if (!R.tested) { host.innerHTML = `<div class="ac-empty">None of the ${fmt(R.obsTotal)} substrates in GrowthDB's spectrum for <i>${esc(sp)}</i> have an exchange in this model — nothing to test.</div>`; return; }
-  renderSpectrumResult(host, sp, { ...R, strainTok, aerobic });
+  renderSpectrumResult(host, sp, { ...R, strainTok, o2pref: spec.o2, o2overridden: o2override != null });
+  // secondary: nitrogen / sulfur / phosphorus source spectra (each needs a background carbon)
+  const roles = ['nitrogen', 'sulfur', 'phosphorus'].filter(r => (spec.np[r] || []).length || (spec.nn[r] || []).length);
+  if (roles.length) {
+    const refCarbon = await findRefCarbon(sp, strainTok, o2open);
+    for (const role of roles) {
+      const rr = await computeSpectrum(sp, strainTok, o2override, 0, (i, n) => { prog.innerHTML = `Testing ${role} source <b>${i}/${n}</b>…`; }, { role, refCarbon });
+      if (rr) renderSpectrumResult(host, sp, { ...rr, strainTok, o2pref: spec.o2, refCarbonMet: refCarbon && refCarbon.met });
+    }
+  }
+  prog.remove();
 }
 function renderSpectrumResult(host, sp, R) {
+  const role = R.role || 'carbon';
+  if (role !== 'carbon') {                         // secondary N/S/P panel
+    if (R.noRefCarbon) { host.appendChild(el('div', 'ac-interp', `<b>${role[0].toUpperCase() + role.slice(1)}-source spectrum:</b> skipped — the model doesn't grow on any known carbon source, so there's no background carbon to test ${role} utilisation against.`)); return; }
+    if (!R.tested) return;
+    host.appendChild(el('div', '', `<h3 style="margin:14px 0 4px">${role[0].toUpperCase() + role.slice(1)}-source utilisation <span class="note">— substrate as sole ${role.replace('phosphorus', 'P').replace('nitrogen', 'N').replace('sulfur', 'S')} source, with ${R.refCarbonMet ? '<code>' + esc(R.refCarbonMet) + '</code>' : 'a background carbon'} as carbon</span></h3>`));
+  }
   const n = R.TP + R.TN + R.FP + R.FN;
   const acc = n ? (R.TP + R.TN) / n : 0;
   const sens = (R.TP + R.FN) ? R.TP / (R.TP + R.FN) : 0, spc = (R.TN + R.FP) ? R.TN / (R.TN + R.FP) : 0;
   const den = Math.sqrt((R.TP + R.FP) * (R.TP + R.FN) * (R.TN + R.FP) * (R.TN + R.FN));
   const mcc = den ? (R.TP * R.TN - R.FP * R.FN) / den : 0;
   const mcls = mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad';
-  host.innerHTML = '';
   host.appendChild(el('div', 'ac-kpis', kpi((100 * acc).toFixed(0) + '%', 'accuracy', acc >= 0.8 ? 'ok' : 'warn') + kpi(mcc.toFixed(2), 'MCC', mcls) + kpi((100 * sens).toFixed(0) + '%', 'sensitivity (recall)', 'info') + kpi((100 * spc).toFixed(0) + '%', 'specificity', 'info') + kpi(n, 'substrates tested', 'info')));
   // 2x2 confusion matrix
   const cm = el('div', ''); cm.style.cssText = 'display:grid;grid-template-columns:auto 1fr 1fr;gap:2px;max-width:420px;margin:6px 0 12px;font-size:12.5px';
@@ -1113,12 +1160,15 @@ function renderSpectrumResult(host, sp, R) {
     cell('<b>model: grows</b>', 'var(--surface-2)') + cell(`<b>${R.TP}</b><br>true +`, '#dcfce7', '#15803D') + cell(`<b>${R.FP}</b><br>false +`, '#fef3c7', '#B45309') +
     cell('<b>model: no-grow</b>', 'var(--surface-2)') + cell(`<b>${R.FN}</b><br>false −`, '#fee2e2', '#DC2626') + cell(`<b>${R.TN}</b><br>true −`, '#dcfce7', '#15803D');
   host.appendChild(cm);
-  host.appendChild(el('div', 'ac-interp', `Tested <b>${R.tested}</b> substrates that have an exchange in the model${R.notInModel ? ` (${R.notInModel} more in GrowthDB's spectrum have no exchange here — a coverage gap)` : ''}. ${R.strainN ? `<b>${R.strainN}</b> calls are specific to strain <code>${esc(R.strainTok)}</code>; the rest are the species consensus.` : 'Species-level spectrum (no strain-specific calls matched).'} O₂ ${R.aerobic ? 'open (aerobic test)' : 'closed (anaerobic test)'}.`));
+  const o2txt = R.o2open ? 'O₂ open' : 'O₂ closed';
+  const o2why = R.o2overridden ? ' (you set this)' : R.o2pref ? ` (auto — GrowthDB lists this organism as <b>${esc(R.o2pref)}</b>)` : ' (default; O₂ preference unknown)';
+  host.appendChild(el('div', 'ac-interp', `Tested <b>${R.tested}</b> substrates that have an exchange in the model${R.notInModel ? ` (${R.notInModel} more in GrowthDB's spectrum have no exchange here — a coverage gap)` : ''}. ${R.strainN ? `<b>${R.strainN}</b> calls are specific to strain <code>${esc(R.strainTok)}</code>; the rest are the species consensus.` : (role === 'carbon' ? 'Species-level spectrum (no strain-specific calls matched).' : '')} ${o2txt}${o2why}.`));
   const list = (title, arr, note, color) => { if (!arr.length) return; const c = el('div', 'ac-card'); c.style.marginTop = '8px'; c.appendChild(el('h3', '', title)); c.appendChild(el('div', 'sub', note));
     const l = el('div', ''); l.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px'; arr.slice(0, 60).forEach(x => { const s = el('span', ''); s.style.cssText = `padding:3px 9px;border-radius:12px;font-size:12px;background:var(--surface-2);border:1px solid ${color}`; s.innerHTML = `<code>${esc(x.b)}</code>`; l.appendChild(s); }); c.appendChild(l);
     if (arr.length > 60) c.appendChild(el('div', 'sub', `…and ${arr.length - 60} more.`)); host.appendChild(c); };
-  list(`False negatives — model can't grow but the organism does (${R.fn.length})`, R.fn, 'The strongest curation targets: a missing transporter or biosynthetic/catabolic pathway blocks growth on these. Gap-fill candidates.', '#DC2626');
-  list(`False positives — model grows but the organism doesn't (${R.fp.length})`, R.fp, 'The model is over-permissive on these: a missing regulatory constraint, an erroneous reaction, or a gap-fill that shouldn\'t be there.', '#B45309');
+  const src = role === 'carbon' ? '' : ` as a ${role} source`;
+  list(`False negatives — model can't grow but the organism does${src} (${R.fn.length})`, R.fn, `The strongest curation targets: a missing transporter or biosynthetic/catabolic pathway blocks growth on these${src}. Gap-fill candidates.`, '#DC2626');
+  list(`False positives — model grows but the organism doesn't${src} (${R.fp.length})`, R.fp, 'The model is over-permissive on these: a missing regulatory constraint, an erroneous reaction, or a gap-fill that shouldn\'t be there.', '#B45309');
 }
 function validationCoverage(sp, detTok) {
   const idxs = GDB.bySpecies[sp] || [];
@@ -1155,10 +1205,12 @@ function renderCoveragePanel(host, sp, detTok, detStrainName) {
   if (avail.length) {
     const bar = el('div', ''); bar.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap';
     const btn = el('button', 'ac-btn primary', '◆ Score this GEM against GrowthDB');
+    const spO2 = (spectrumFor(sp, detTok) || {}).o2;
     const aer = el('label', ''); aer.style.cssText = 'font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:5px';
-    aer.innerHTML = '<input type="checkbox" id="score-aer" checked> assume aerobic';
+    aer.innerHTML = `<input type="checkbox" id="score-aer" ${o2IsOpen(spO2, null) ? 'checked' : ''}> aerobic${spO2 ? ' (auto: ' + esc(spO2) + ')' : ''}`;
     const sc = el('div', ''); sc.id = 'score-out'; sc.style.marginTop = '12px';
-    btn.onclick = () => { btn.disabled = true; runScorecard(sp, detTok, sc, document.getElementById('score-aer').checked).finally(() => btn.disabled = false); };
+    const autoO2 = o2IsOpen(spO2, null);
+    btn.onclick = () => { btn.disabled = true; const box = document.getElementById('score-aer').checked; runScorecard(sp, detTok, sc, box === autoO2 ? null : box).finally(() => btn.disabled = false); };
     bar.append(btn, aer); card.appendChild(bar); card.appendChild(sc);
   }
   host.appendChild(card);
@@ -1174,7 +1226,7 @@ async function solveCondition(cond) {
   const res = await fba(MODEL, bio.id, ov);
   return { predMu: Math.max(0, res.obj), feasible: res.obj > 1e-6, res };
 }
-async function runScorecard(sp, detTok, host, aerobic) {
+async function runScorecard(sp, detTok, host, o2override) {
   host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Scoring the GEM across all validation types…</span></div>`;
   await new Promise(r => setTimeout(r, 20));
   const bio = findBiomass(MODEL);
@@ -1197,7 +1249,7 @@ async function runScorecard(sp, detTok, host, aerobic) {
     if (k % 4 === 0 || k === sample.length - 1) { prog.innerHTML = `Simulating growth condition <b>${k + 1}/${sample.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
   }
   prog.innerHTML = 'Sweeping the substrate spectrum…'; await new Promise(z => setTimeout(z, 0));
-  const spec = await computeSpectrum(sp, detTok, aerobic, 90, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
+  const spec = await computeSpectrum(sp, detTok, o2override, 90, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
   renderScorecard(host, sp, detTok, {
     feasN, grow, feasAcc: feasN ? grow / feasN : null, sampled: sample.length, withMed: withMed.length, strainCond,
     muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec, aerobic
@@ -1238,10 +1290,11 @@ function renderSpectrumPanel(host, sp, detTok) {
   if (!spec || (!spec.pos.size && !spec.neg.size)) { card.innerHTML = `<h3>Substrate-utilisation validation</h3><div class="sub">No grows-on/no-grow spectrum in GrowthDB for <i>${esc(sp)}</i> — can't run the substrate confusion matrix for this organism.</div>`; host.appendChild(card); return; }
   card.innerHTML = `<h3>Substrate-utilisation validation <span class="note">— the standard GEM Biolog check</span></h3>
     <div class="sub">Sweeps every substrate GrowthDB knows <i>${esc(sp)}</i> ${spec.strainN ? '(and strain <code>' + esc(detTok) + '</code>) ' : ''}grows / doesn't grow on (<b>${fmt(spec.pos.size)}</b> grows-on, <b>${fmt(spec.neg.size)}</b> no-grow): sets it as the sole carbon source, runs FBA, and builds a confusion matrix. False negatives = gap-fill targets; false positives = over-permissive reactions.</div>
-    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);margin:10px 0"><input type="checkbox" id="spec-aer" checked> aerobic (open O₂)</label>`;
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);margin:10px 0"><input type="checkbox" id="spec-aer" ${o2IsOpen(spec.o2, null) ? 'checked' : ''}> aerobic (open O₂)${spec.o2 ? ' <span style="color:var(--ink-3)">— GrowthDB lists this organism as <b>' + esc(spec.o2) + '</b>, set accordingly</span>' : ''}</label>`;
   const btn = el('button', 'ac-btn primary', '▶ Run substrate-spectrum validation'); btn.style.marginLeft = '12px';
   const out = el('div', ''); out.style.marginTop = '12px';
-  btn.onclick = () => { btn.disabled = true; btn.textContent = 'Running…'; runSpectrumValidation(sp, detTok, out, card.querySelector('#spec-aer').checked).then(() => { btn.disabled = false; btn.textContent = '↻ Re-run'; }); };
+  const auto = o2IsOpen(spec.o2, null);
+  btn.onclick = () => { btn.disabled = true; btn.textContent = 'Running…'; const box = card.querySelector('#spec-aer').checked; runSpectrumValidation(sp, detTok, out, box === auto ? null : box).then(() => { btn.disabled = false; btn.textContent = '↻ Re-run'; }); };
   card.appendChild(btn); card.appendChild(out); host.appendChild(card);
 }
 

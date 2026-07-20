@@ -149,10 +149,11 @@ if os.path.isdir(SPECIES_DIR):
         if not sp:
             continue
         dv = d.get("derived") or {}
-        pos, neg = set(), set()
+        pos, neg = set(), set()                        # CARBON-source spectrum
         by_strain = {}
+        rpos = {}; rneg = {}                            # non-carbon spectrum, keyed by role (nitrogen/sulfur/phosphorus)
         for ex in (dv.get("utilizable_exchanges") or []):
-            pos.add(ex)
+            pos.add(ex)                                # derived carbon-utilisation set
         for r in (d.get("carbon_growth") or []):
             ex = r.get("exchange")
             if ex:
@@ -160,13 +161,31 @@ if os.path.isdir(SPECIES_DIR):
                 st = r.get("strain")
                 if st:
                     by_strain.setdefault(st, set()).add(ex)
+        # phenotypes carry the substrate ROLE in `category` and the call in `phenotype` (positive/negative)
         for p in (d.get("phenotypes") or []):
-            if p.get("ptype") in ("growth", "growth+acid") and p.get("exchange"):
-                (pos if p.get("phenotype") == "positive" else neg).add(p["exchange"])
-        neg -= pos                                    # positive evidence wins a conflict
-        if pos or neg:
-            spectrum[sp] = {"p": sorted(pos), "n": sorted(neg),
-                            "s": {st: sorted(ex) for st, ex in by_strain.items() if ex}}
+            ex = p.get("exchange")
+            if not ex:
+                continue
+            cat = p.get("category") or "carbon"
+            is_pos = p.get("phenotype") == "positive"
+            if cat == "carbon":
+                (pos if is_pos else neg).add(ex)
+            elif cat in ("nitrogen", "sulfur", "phosphorus"):
+                (rpos if is_pos else rneg).setdefault(cat, set()).add(ex)
+        neg -= pos                                    # positive evidence wins a conflict (carbon)
+        for cat in list(rneg):
+            rneg[cat] -= rpos.get(cat, set())
+        o2 = dv.get("oxygen_preference")
+        if pos or neg or rpos or rneg:
+            entry = {"p": sorted(pos), "n": sorted(neg),
+                     "s": {st: sorted(ex) for st, ex in by_strain.items() if ex}}
+            if o2:
+                entry["o2"] = o2
+            if rpos:
+                entry["np"] = {c: sorted(v) for c, v in rpos.items() if v}
+            if rneg:
+                entry["nn"] = {c: sorted(v) for c, v in rneg.items() if v}
+            spectrum[sp] = entry
 with open(OUT + "/spectrum.json", "w") as fh:
     json.dump(spectrum, fh, separators=(",", ":"))
 n_pos = sum(len(v["p"]) for v in spectrum.values())
