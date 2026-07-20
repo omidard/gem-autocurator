@@ -905,7 +905,7 @@ function conditionFromRecord(idx) {
     const row = add(u.met, lb, 'exp', { r: u.r, u: u.u, fu: !!u.fu });
     if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u, fu: !!u.fu }; if (!INORG_SET.has(u.met)) row.lb = usable ? u.r : -CARBON_UPTAKE; } });
   const mf = maintFor(rec.sp);
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, medType: rec.med.mt, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
 }
 function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
 function blankCondition(species) {
@@ -931,6 +931,13 @@ function renderCondition(cond, isManual) {
     <input id="val-ngam" type="number" step="0.01" min="0" value="${cond.ngam == null ? '' : cond.ngam}" placeholder="${maintRxn ? '0' : 'n/a'}" ${maintRxn ? '' : 'disabled'} style="width:100px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)">
     <span style="font-size:11.5px;color:var(--ink-3)">${!maintRxn ? '— model has no ATP-maintenance reaction to constrain' : (cond.ngamSrc === 'growthdb' ? '<b style="color:#15803D">GrowthDB-fitted</b>' + (cond.yxs ? ` · biomass yield Yxs=${cond.yxs} gDW mmol⁻¹` : '') : 'no GrowthDB maintenance fit for this species — enter your own or leave blank') + ` · applies to <code>${esc(maintRxn.id)}</code>`}</span>`;
   card.appendChild(mbar);
+  // honesty banner: a defined-medium FBA is only meaningful for a chemically defined medium
+  const MTYPE = { in_vivo: ['grown in vivo / in a host', 'This organism was grown inside a host or tissue, not in a defined medium — there is no exchange recipe to constrain, so a growth-feasibility result here is not a valid GEM check.'],
+    environmental: ['environmental sample', 'Grown in a natural sample (seawater/soil/freshwater) of unknown exact composition — a defined-medium FBA cannot represent it faithfully.'],
+    complex_undefined: ['complex / undefined medium', 'This medium contains undefinable pools (peptone, yeast extract, a commercial broth, or a variable feedstock). The defined components below can be simulated, but a no-growth result may reflect the missing rich components, not a metabolic gap.'],
+    named_other: ['named medium, recipe not yet resolved', 'The medium is named but its exact composition has not been formulated to exchanges — only the minerals below are set. Treat any result as provisional.'] };
+  if (!cond.manual && cond.medType && MTYPE[cond.medType]) { const mm = MTYPE[cond.medType];
+    card.appendChild(el('div', '', `<div style="margin:4px 0 8px;padding:8px 11px;border-radius:8px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:12.5px"><b>⚠ ${esc(mm[0])}.</b> ${esc(mm[1])}</div>`)); }
   const tbl = el('div', ''); tbl.id = 'val-tbl'; card.appendChild(tbl);
   // add-exchange control
   const addbar = el('div', ''); addbar.style.cssText = 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center';
@@ -1115,15 +1122,16 @@ function renderSpectrumResult(host, sp, R) {
 }
 function validationCoverage(sp, detTok) {
   const idxs = GDB.bySpecies[sp] || [];
-  let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0;
+  let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0, nonFormulable = 0;
   idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok);
     if (hit) strainRecs++;
     if (r.mu != null && r.mu_ok !== false) { mu++; if (hit) muStrain++; }
     if ((r.up || []).concat(r.sec || []).some(x => x.fu)) flux++;
     if (r.med && (r.med.id || (r.med.ex && r.med.ex.length))) media++;
+    else if (r.med && ['in_vivo', 'environmental', 'complex_undefined'].includes(r.med.mt)) nonFormulable++;
   });
   const spec = spectrumFor(sp, detTok); const maint = maintFor(sp);
-  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media,
+  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable,
     specPos: spec ? spec.pos.size : 0, specNeg: spec ? spec.neg.size : 0, specStrain: spec ? spec.strainN : 0, maint: !!maint };
 }
 function renderCoveragePanel(host, sp, detTok, detStrainName) {
@@ -1142,7 +1150,7 @@ function renderCoveragePanel(host, sp, detTok, detStrainName) {
   const avail = [];
   if (c.mu) avail.push('<b>growth-rate</b> (µ vs FBA)'); if (c.flux) avail.push('<b>uptake/secretion flux</b>');
   if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)'); if (c.maint) avail.push('<b>maintenance/yield</b>');
-  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence); only the ${c.specStrain} strain-specific substrate calls are strain-exact.` : ''}`));
+  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${c.nonFormulable ? `<b>${c.nonFormulable}</b> record${c.nonFormulable > 1 ? 's were' : ' was'} grown in vivo, in an environmental sample, or in a complex/undefined medium — those can't support a defined-medium FBA and are excluded from the feasibility/µ checks. ` : ''}${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence); only the ${c.specStrain} strain-specific substrate calls are strain-exact.` : ''}`));
   // one-click aggregate scorecard across every validation type
   if (avail.length) {
     const bar = el('div', ''); bar.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap';

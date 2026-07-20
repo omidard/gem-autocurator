@@ -94,7 +94,10 @@ for r in gr:
         "med": {"id": mid, "key": med.get("canonical_key"), "name": med.get("canonical_name") or med.get("description"),
                 # exchanges formulated from the paper's own recipe (when the medium isn't a linked Media DB id)
                 "ex": [[e["exchange"], e["lb"]] for e in (med.get("exchanges") or [])] or None,
-                "fmt": med.get("formulation")},
+                "fmt": med.get("formulation"),
+                # medium_type: defined media give a real FBA validation; in_vivo/environmental/complex_undefined
+                # cannot yield an exact exchange set, so the autocurator must say so rather than fake it
+                "mt": med.get("medium_type"), "formulable": med.get("formulable")},
         "cond": {"o2": cond.get("oxygen"), "t": cond.get("temperature_C"), "pH": cond.get("pH"),
                  "mode": cond.get("culture_mode"), "D": cond.get("dilution_rate_per_h")},
         "cit": (prov.get("citation") or "")[:180], "doi": prov.get("doi"),
