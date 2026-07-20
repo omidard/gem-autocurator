@@ -1184,9 +1184,11 @@ function validationCoverage(sp, detTok) {
   const idxs = GDB.bySpecies[sp] || [];
   let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0, nonFormulable = 0, spLevel = 0, koFam = 0;
   const parents = new Set();
+  let noStrain = 0; let noStrainWhy = null;
   idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok);
     if (hit) strainRecs++;
     if (r.lvl === 'species') spLevel++;
+    if (r.lvl === 'unknown') { noStrain++; if (!noStrainWhy && r.lvlwhy) noStrainWhy = r.lvlwhy; }
     if (r.parent) parents.add(r.parent);
     if (r.ko && r.sim && r.med && (r.med.id || r.med.ex)) koFam++;
     if (r.mu != null && r.mu_ok !== false) { mu++; if (hit) muStrain++; }
@@ -1195,7 +1197,7 @@ function validationCoverage(sp, detTok) {
     else if (r.med && ['in_vivo', 'environmental', 'complex_undefined'].includes(r.med.mt)) nonFormulable++;
   });
   const spec = spectrumFor(sp, detTok); const maint = maintFor(sp);
-  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable, spLevel, koFam, nParents: parents.size,
+  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable, spLevel, koFam, nParents: parents.size, noStrain, noStrainWhy,
     specPos: spec ? spec.pos.size : 0, specNeg: spec ? spec.neg.size : 0, specStrain: spec ? spec.strainN : 0, maint: !!maint };
 }
 // which reaction the FBA maximises — surface it and let the user pick when a model has several biomass objectives
@@ -1234,7 +1236,7 @@ function renderCoveragePanel(host, sp, detTok, detStrainName) {
   if (c.mu) avail.push('<b>growth-rate</b> (µ vs FBA)'); if (c.flux) avail.push('<b>uptake/secretion flux</b>');
   if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)');
   if (c.koFam) avail.push('<b>genotype-aware knockout</b> simulation'); if (c.maint) avail.push('<b>maintenance/yield</b>');
-  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${c.koFam ? `Records are grouped under <b>${c.nParents}</b> parent strain${c.nParents > 1 ? 's' : ''}; the genotype-aware panel simulates the wild type and each of the <b>${c.koFam}</b> knockout derivatives on one model. ` : ''}${c.spLevel ? `<b>${c.spLevel}</b> µ value${c.spLevel > 1 ? 's are' : ' is'} species-level references (Madin trait synthesis — no specific strain; use as species-typical growth, lower confidence than a strain-matched value). ` : ''}${c.nonFormulable ? `<b>${c.nonFormulable}</b> record${c.nonFormulable > 1 ? 's were' : ' was'} grown in vivo, in an environmental sample, or in a complex/undefined medium — excluded from the feasibility/µ checks. ` : ''}${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence).` : ''}`));
+  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${c.koFam ? `Records are grouped under <b>${c.nParents}</b> parent strain${c.nParents > 1 ? 's' : ''}; the genotype-aware panel simulates the wild type and each of the <b>${c.koFam}</b> knockout derivatives on one model. ` : ''}${c.spLevel ? `<b>${c.spLevel}</b> µ value${c.spLevel > 1 ? 's are' : ' is'} species-level references (Madin trait synthesis — no specific strain; use as species-typical growth, lower confidence than a strain-matched value). ` : ''}${c.noStrain ? `<b>${c.noStrain}</b> record${c.noStrain > 1 ? 's' : ''} carry no strain because ${esc(c.noStrainWhy || 'the source states none')} — verified by mining, not a lookup failure. ` : ''}${c.nonFormulable ? `<b>${c.nonFormulable}</b> record${c.nonFormulable > 1 ? 's were' : ' was'} grown in vivo, in an environmental sample, or in a complex/undefined medium — excluded from the feasibility/µ checks. ` : ''}${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence).` : ''}`));
   // one-click aggregate scorecard across every validation type
   if (avail.length) {
     const bar = el('div', ''); bar.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap';

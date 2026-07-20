@@ -97,7 +97,7 @@ for r in gr:
         "ko": ko_genes or None, "sim": bool(spar.get("simulable")),
         "gother": any(o.get("op") == "other" for o in (spar.get("genotype") or [])),
         # strain resolution level: 'strain' (specific) / 'species' (species-level reference) / 'unknown'
-        "lvl": spar.get("level"),
+        "lvl": spar.get("level"), "lvlwhy": spar.get("strain_reason"),
         "mu": round(float(mu), 4) if mu is not None else None,
         "mu_ok": r.get("mu_usable"), "mu_qc": r.get("mu_qc"),
         "dt": r.get("doubling_time_h"),
