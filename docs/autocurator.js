@@ -721,8 +721,12 @@ function strainFromName(name) {   // infraspecific remainder of an NCBI organism
   const sp = speciesNorm(name); const rest = String(name).slice(String(name).toLowerCase().indexOf(sp.toLowerCase()) + sp.length).trim();
   return rest ? rest.replace(/^(str\.?|substr\.?)\s+/i, '') : null;
 }
-function strainMatch(recSstd, recStrain, detTok) {
+// general strain grouping key (mirror of GrowthDB canonicalize_strains.parent_key): collapses
+// surface forms so 'MG1655' / 'K-12 MG1655' / 'MG 1655' all key the same
+function pkeyJs(s) { return String(s || '').toLowerCase().replace(/^(str\.?|substr\.?|strain|substrain)\s+/, '').replace(/\bk[\s-]?12\b/g, '').replace(/\balpha\b/g, 'a').replace(/[^a-z0-9]/g, ''); }
+function strainMatch(recSstd, recStrain, detTok, recParent) {
   if (!detTok) return false;
+  if (recParent && pkeyJs(recParent) && pkeyJs(recParent) === pkeyJs(detTok)) return true;   // same canonical parent
   if (recSstd && recSstd === detTok) return true;
   const rn = (recStrain || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (rn && rn.includes(detTok)) return true;
@@ -829,7 +833,7 @@ function showRecords(sp, detTok, detStrainName) {
   const idxs = GDB.bySpecies[sp] || [];
   if (!idxs.length) { showNoData(sp); return; }
   const same = [], other = [], nostrain = [];
-  idxs.forEach(i => { const r = GDB.records[i]; if (detTok && strainMatch(r.sstd, r.strain, detTok)) same.push(i); else if (r.strain || r.sstd) other.push(i); else nostrain.push(i); });
+  idxs.forEach(i => { const r = GDB.records[i]; if (detTok && strainMatch(r.sstd, r.strain, detTok, r.parent)) same.push(i); else if (r.strain || r.sstd) other.push(i); else nostrain.push(i); });
   const head = el('div', 'ac-card');
   head.innerHTML = `<h3><i>${esc(sp)}</i> — ${idxs.length} record${idxs.length === 1 ? '' : 's'}</h3>
     <div class="sub">Pick a condition to load into the editable simulator.${detTok ? ` Records for strain <code>${esc(detTok)}</code> are grouped first; other strains are collapsed below.` : ''}</div>
@@ -1185,7 +1189,7 @@ function validationCoverage(sp, detTok) {
   let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0, nonFormulable = 0, spLevel = 0, koFam = 0;
   const parents = new Set();
   let noStrain = 0; let noStrainWhy = null;
-  idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok);
+  idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok, r.parent);
     if (hit) strainRecs++;
     if (r.lvl === 'species') spLevel++;
     if (r.lvl === 'unknown') { noStrain++; if (!noStrainWhy && r.lvlwhy) noStrainWhy = r.lvlwhy; }
@@ -1302,14 +1306,14 @@ async function runScorecard(sp, detTok, host, o2override) {
   // conditions with a usable medium (linked or formulated); strain-specific first, then cap for responsiveness
   const withMed = idxs.filter(i => { const r = GDB.records[i]; return r.med && ((r.med.id && MEDIA[r.med.id]) || (r.med.ex && r.med.ex.length)); });
   // prioritise the most informative conditions: yield-constrained (measured uptake) first, then strain-specific
-  const prio = i => { const r = GDB.records[i]; const flux = (r.up || []).some(x => x.fu && x.r < 0) ? 2 : 0; const strainM = detTok && strainMatch(r.sstd, r.strain, detTok) ? 1 : 0; return flux + strainM; };
+  const prio = i => { const r = GDB.records[i]; const flux = (r.up || []).some(x => x.fu && x.r < 0) ? 2 : 0; const strainM = detTok && strainMatch(r.sstd, r.strain, detTok, r.parent) ? 1 : 0; return flux + strainM; };
   withMed.sort((a, b) => prio(b) - prio(a));
   const CAP = 40; const sample = withMed.slice(0, CAP);
   const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2)'; host.innerHTML = ''; host.appendChild(prog);
   let feasN = 0, grow = 0; const muPairs = []; let secHit = 0, secTot = 0, secRateN = 0, secRateHit = 0; let strainCond = 0;
   for (let k = 0; k < sample.length; k++) {
     const i = sample[k]; const cond = conditionFromRecord(i);
-    if (detTok && strainMatch(GDB.records[i].sstd, GDB.records[i].strain, detTok)) strainCond++;
+    if (detTok && strainMatch(GDB.records[i].sstd, GDB.records[i].strain, detTok, GDB.records[i].parent)) strainCond++;
     const r = await solveCondition(cond);
     if (r && !r.noCarbon) { feasN++; if (r.feasible) grow++;
       // yield-constrained = the record's own measured specific uptake bounds the carbon (predicted µ = uptake × yield, a real quantitative test)
