@@ -1177,16 +1177,20 @@ function renderSpectrumResult(host, sp, R) {
 }
 function validationCoverage(sp, detTok) {
   const idxs = GDB.bySpecies[sp] || [];
-  let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0, nonFormulable = 0;
+  let mu = 0, muStrain = 0, flux = 0, media = 0, strainRecs = 0, nonFormulable = 0, spLevel = 0, koFam = 0;
+  const parents = new Set();
   idxs.forEach(i => { const r = GDB.records[i]; const hit = detTok && strainMatch(r.sstd, r.strain, detTok);
     if (hit) strainRecs++;
+    if (r.lvl === 'species') spLevel++;
+    if (r.parent) parents.add(r.parent);
+    if (r.ko && r.sim && r.med && (r.med.id || r.med.ex)) koFam++;
     if (r.mu != null && r.mu_ok !== false) { mu++; if (hit) muStrain++; }
     if ((r.up || []).concat(r.sec || []).some(x => x.fu)) flux++;
     if (r.med && (r.med.id || (r.med.ex && r.med.ex.length))) media++;
     else if (r.med && ['in_vivo', 'environmental', 'complex_undefined'].includes(r.med.mt)) nonFormulable++;
   });
   const spec = spectrumFor(sp, detTok); const maint = maintFor(sp);
-  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable,
+  return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable, spLevel, koFam, nParents: parents.size,
     specPos: spec ? spec.pos.size : 0, specNeg: spec ? spec.neg.size : 0, specStrain: spec ? spec.strainN : 0, maint: !!maint };
 }
 function renderCoveragePanel(host, sp, detTok, detStrainName) {
@@ -1200,12 +1204,14 @@ function renderCoveragePanel(host, sp, detTok, detStrainName) {
     kpi(c.flux, 'flux-usable rate conditions', c.flux ? 'ok' : 'info') +
     kpi(c.media, 'GEM-ready media', c.media ? 'ok' : 'warn') +
     kpi(c.specPos + c.specNeg, 'substrate spectrum calls', (c.specPos + c.specNeg) ? 'ok' : 'warn') +
-    kpi(detTok ? c.specStrain : '—', 'strain-specific substrates', c.specStrain ? 'ok' : 'info') +
+    kpi(c.koFam, 'knockout derivatives (simulable)', c.koFam ? 'ok' : 'info') +
+    kpi(c.spLevel, 'species-level µ references', c.spLevel ? 'info' : 'info') +
     kpi(c.maint ? 'yes' : 'no', 'GrowthDB NGAM/yield fit', c.maint ? 'ok' : 'info')));
   const avail = [];
   if (c.mu) avail.push('<b>growth-rate</b> (µ vs FBA)'); if (c.flux) avail.push('<b>uptake/secretion flux</b>');
-  if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)'); if (c.maint) avail.push('<b>maintenance/yield</b>');
-  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${c.nonFormulable ? `<b>${c.nonFormulable}</b> record${c.nonFormulable > 1 ? 's were' : ' was'} grown in vivo, in an environmental sample, or in a complex/undefined medium — those can't support a defined-medium FBA and are excluded from the feasibility/µ checks. ` : ''}${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence); only the ${c.specStrain} strain-specific substrate calls are strain-exact.` : ''}`));
+  if (c.specPos + c.specNeg) avail.push('<b>substrate-utilisation spectrum</b> (confusion matrix)');
+  if (c.koFam) avail.push('<b>genotype-aware knockout</b> simulation'); if (c.maint) avail.push('<b>maintenance/yield</b>');
+  card.appendChild(el('div', 'ac-interp', `${avail.length ? 'Runnable validations: ' + avail.join(' · ') + '.' : 'No quantitative validation data for this organism.'} ${c.koFam ? `Records are grouped under <b>${c.nParents}</b> parent strain${c.nParents > 1 ? 's' : ''}; the genotype-aware panel simulates the wild type and each of the <b>${c.koFam}</b> knockout derivatives on one model. ` : ''}${c.spLevel ? `<b>${c.spLevel}</b> µ value${c.spLevel > 1 ? 's are' : ' is'} species-level references (Madin trait synthesis — no specific strain; use as species-typical growth, lower confidence than a strain-matched value). ` : ''}${c.nonFormulable ? `<b>${c.nonFormulable}</b> record${c.nonFormulable > 1 ? 's were' : ' was'} grown in vivo, in an environmental sample, or in a complex/undefined medium — excluded from the feasibility/µ checks. ` : ''}${detTok && !c.strainRecs ? `<b>No growth records for strain ${esc(detStrainName || detTok)}</b> — the µ/rate/media checks fall back to the species (lower confidence).` : ''}`));
   // one-click aggregate scorecard across every validation type
   if (avail.length) {
     const bar = el('div', ''); bar.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap';
