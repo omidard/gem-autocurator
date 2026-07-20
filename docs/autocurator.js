@@ -1044,7 +1044,15 @@ async function computeSpectrum(sp, strainTok, aerobic, cap, onProg) {
   spec.neg.forEach(ex => { const b = metOfExId(ex); if (!obsMap.has(b)) obsMap.set(b, 'neg'); });
   let items = []; obsMap.forEach((obs, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs }); });
   const notInModel = obsMap.size - items.length;
-  const capped = cap && items.length > cap; if (capped) items = items.slice(0, cap);
+  // cap must KEEP CLASS BALANCE: positives are inserted before negatives, so a naive first-N slice
+  // takes only grows-on calls -> zero negatives -> TN=FP=0 -> MCC collapses to 0. Sample both classes.
+  const capped = cap && items.length > cap;
+  if (capped) {
+    const pos = items.filter(x => x.obs === 'pos'), neg = items.filter(x => x.obs === 'neg');
+    const nNeg = Math.min(neg.length, Math.max(neg.length ? 1 : 0, Math.round(cap * neg.length / items.length)));
+    const nPos = Math.min(pos.length, cap - nNeg);
+    items = pos.slice(0, nPos).concat(neg.slice(0, nNeg));
+  }
   const NPS = ['nh4', 'pi', 'so4'];
   let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
   for (let i = 0; i < items.length; i++) {
@@ -1171,7 +1179,7 @@ async function runScorecard(sp, detTok, host, aerobic) {
     if (k % 4 === 0 || k === sample.length - 1) { prog.innerHTML = `Simulating growth condition <b>${k + 1}/${sample.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
   }
   prog.innerHTML = 'Sweeping the substrate spectrum…'; await new Promise(z => setTimeout(z, 0));
-  const spec = await computeSpectrum(sp, detTok, aerobic, 60, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
+  const spec = await computeSpectrum(sp, detTok, aerobic, 90, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
   renderScorecard(host, sp, detTok, {
     feasN, grow, feasAcc: feasN ? grow / feasN : null, sampled: sample.length, withMed: withMed.length, strainCond,
     muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec, aerobic
@@ -1188,7 +1196,7 @@ function renderScorecard(host, sp, detTok, S) {
     dims.push({ label: 'Growth-rate agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${S.muPairs.length} predicted µ within 2× of measured (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). FBA maximises growth, so it sets an upper bound and tends to over-predict.`, w: frac });
   }
   if (S.spec && S.spec.tested) { const mcc = spectrumMCC(S.spec); const norm = (mcc + 1) / 2;
-    dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ' (capped at 60 substrates)' : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm }); }
+    dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ` (${S.spec.tested}-substrate balanced sample)` : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm }); }
   if (S.secTot) { const a = S.secRecall; dims.push({ label: 'Secretion recall', val: (100 * a).toFixed(0) + '%', cls: a >= 0.7 ? 'ok' : a >= 0.4 ? 'warn' : 'bad', detail: `${S.secHit}/${S.secTot} measured secretion products the model can produce under the reported condition`, w: a }); }
   if (!dims.length) { host.appendChild(el('div', 'ac-empty', 'No validation dimension could be scored (no simulable medium and no spectrum).')); return; }
   const overall = dims.reduce((s, d) => s + d.w, 0) / dims.length;
