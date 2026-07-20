@@ -281,10 +281,14 @@ async function fba(model, objId, ov) {
   const r = await g.solve(lp, { msglev: g.GLP_MSG_OFF, presol: true });
   return { obj: (r.result && r.result.z) || 0, vars: (r.result && r.result.vars) || {}, status: r.result ? r.result.status : 0 };
 }
-function findBiomass(model) {
+function biomassCandidates(model) {
   const bios = model.rxns.filter(isBiomass);
   const pool = (bios.length ? bios : model.rxns.filter(r => !isExchange(r)));
-  return pool.slice().sort((a, b) => Object.keys(b.s).length - Object.keys(a.s).length)[0] || null;
+  return pool.slice().sort((a, b) => Object.keys(b.s).length - Object.keys(a.s).length);
+}
+function findBiomass(model) {
+  if (model._obj) { const r = model.rxns.find(x => x.id === model._obj); if (r) return r; }   // user-chosen objective
+  return biomassCandidates(model)[0] || null;
 }
 // the ATP-maintenance (NGAM) reaction: by id/name, else the atp+h2o->adp+pi(+h) hydrolysis reaction
 function findMaintenance(model) {
@@ -833,6 +837,7 @@ function showRecords(sp, detTok, detStrainName) {
   if (detTok && !same.length) head.appendChild(el('div', 'ac-interp', `<b>No strain-matched experimental data.</b> GrowthDB has ${idxs.length} record${idxs.length === 1 ? '' : 's'} for <i>${esc(sp)}</i> but none for strain <b>${esc(detStrainName || detTok)}</b> — a strain-exact validation isn't possible. Use the other-strain records below as a species-level guide, or enter your own.`));
   const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
+  renderObjectivePicker(results, sp, detTok, detStrainName);      // which biomass/objective the FBA maximises
   renderCoveragePanel(results, sp, detTok, detStrainName);        // per-strain validation-resource map
   renderStrainSimPanel(results, sp);                              // genotype-aware wild-type + knockout simulation
   renderSpectrumPanel(results, sp, detTok);                       // grows-on-X confusion-matrix validation
@@ -909,7 +914,7 @@ function conditionFromRecord(idx) {
     if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u, fu: !!u.fu }; if (!INORG_SET.has(u.met)) row.lb = usable ? u.r : -CARBON_UPTAKE; } });
   const mf = maintFor(rec.sp);
   const ko = (rec.ko && rec.ko.length) ? resolveKO(MODEL, rec.ko) : null;   // genotype-aware knockout
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, medType: rec.med.mt, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null,
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u, fu: !!x.fu })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, medType: rec.med.mt, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null,
     parent: rec.parent, isWt: rec.wt, koGenes: rec.ko || null, dead: ko ? ko.dead : null, koMatched: ko ? ko.matched : [], koUnmatched: ko ? ko.unmatched : [] };
 }
 function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
@@ -1193,6 +1198,24 @@ function validationCoverage(sp, detTok) {
   return { cond: idxs.length, strainRecs, mu, muStrain, flux, media, nonFormulable, spLevel, koFam, nParents: parents.size,
     specPos: spec ? spec.pos.size : 0, specNeg: spec ? spec.neg.size : 0, specStrain: spec ? spec.strainN : 0, maint: !!maint };
 }
+// which reaction the FBA maximises — surface it and let the user pick when a model has several biomass objectives
+function renderObjectivePicker(host, sp, detTok, detStrainName) {
+  const cands = biomassCandidates(MODEL).filter(isBiomass).slice(0, 12);
+  const chosen = findBiomass(MODEL); if (!chosen) return;
+  const multi = cands.length > 1;
+  const card = el('div', ''); card.style.cssText = 'margin-top:12px;font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+  card.innerHTML = `<span>Objective the FBA maximises:</span>`;
+  if (multi) {
+    const sel = el('select', ''); sel.style.cssText = 'padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink);font-size:12.5px;max-width:340px';
+    sel.innerHTML = cands.map(r => `<option value="${esc(r.id)}"${r.id === chosen.id ? ' selected' : ''}>${esc(r.id)}${r.name && r.name !== r.id ? ' — ' + esc(r.name.slice(0, 40)) : ''} (${Object.keys(r.s).length} mets)</option>`).join('');
+    sel.onchange = () => { MODEL._obj = sel.value; showRecords(sp, detTok, detStrainName); };   // re-render so all validations use it
+    card.appendChild(sel);
+    card.appendChild(el('span', '', `<span style="color:var(--ink-3)">— ${cands.length} biomass/objective reactions found; pick the one to validate against.</span>`));
+  } else {
+    card.appendChild(el('span', '', `<code>${esc(chosen.id)}</code>${chosen.name && chosen.name !== chosen.id ? ' <span style="color:var(--ink-3)">' + esc(chosen.name.slice(0, 40)) + '</span>' : ''}`));
+  }
+  host.appendChild(card);
+}
 function renderCoveragePanel(host, sp, detTok, detStrainName) {
   const c = validationCoverage(sp, detTok);
   const card = el('div', 'ac-card'); card.style.cssText = 'margin-top:12px';
@@ -1281,7 +1304,7 @@ async function runScorecard(sp, detTok, host, o2override) {
   withMed.sort((a, b) => prio(b) - prio(a));
   const CAP = 40; const sample = withMed.slice(0, CAP);
   const prog = el('div', ''); prog.style.cssText = 'font-size:12.5px;color:var(--ink-2)'; host.innerHTML = ''; host.appendChild(prog);
-  let feasN = 0, grow = 0; const muPairs = []; let secHit = 0, secTot = 0; let strainCond = 0;
+  let feasN = 0, grow = 0; const muPairs = []; let secHit = 0, secTot = 0, secRateN = 0, secRateHit = 0; let strainCond = 0;
   for (let k = 0; k < sample.length; k++) {
     const i = sample[k]; const cond = conditionFromRecord(i);
     if (detTok && strainMatch(GDB.records[i].sstd, GDB.records[i].strain, detTok)) strainCond++;
@@ -1290,7 +1313,9 @@ async function runScorecard(sp, detTok, host, o2override) {
       // yield-constrained = the record's own measured specific uptake bounds the carbon (predicted µ = uptake × yield, a real quantitative test)
       const con = cond.rows.some(x => x.meas && x.meas.fu && x.lb < -1e-9);
       if (cond.mu != null && cond.mu_ok !== false && r.feasible) muPairs.push({ m: cond.mu, p: +r.predMu.toFixed(4), con });
-      cond.sec.forEach(p => { const rid = exByMet[p.met]; if (!rid) return; secTot++; const f = r.res ? (r.res.vars[rid] || 0) : 0; if (f > 1e-6) secHit++; }); }
+      cond.sec.forEach(p => { const rid = exByMet[p.met]; if (!rid) return; secTot++; const f = r.res ? (r.res.vars[rid] || 0) : 0; if (f > 1e-6) secHit++;
+        // quantitative: when the secretion rate is biomass-specific, compare predicted vs measured magnitude
+        if (p.fu && p.r != null && Math.abs(p.r) > 1e-6) { secRateN++; const ratio = Math.abs(f) / Math.abs(p.r); if (ratio >= 0.5 && ratio <= 2) secRateHit++; } }); }
     if (k % 4 === 0 || k === sample.length - 1) { prog.innerHTML = `Simulating growth condition <b>${k + 1}/${sample.length}</b>…`; await new Promise(z => setTimeout(z, 0)); }
   }
   // knockout-phenotype accuracy: simulate the wild type + each simulable KO derivative, does grow/no-grow match?
@@ -1309,31 +1334,34 @@ async function runScorecard(sp, detTok, host, o2override) {
   const spec = await computeSpectrum(sp, detTok, o2override, 90, (i, n) => { prog.innerHTML = `Sweeping substrate <b>${i}/${n}</b>…`; });
   renderScorecard(host, sp, detTok, {
     feasN, grow, feasAcc: feasN ? grow / feasN : null, sampled: sample.length, withMed: withMed.length, strainCond,
-    muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, spec,
+    muPairs, secHit, secTot, secRecall: secTot ? secHit / secTot : null, secRateN, secRateHit, spec,
     koTested, koMatch, koApplied, koCand: koIdx.length
   });
 }
 function renderScorecard(host, sp, detTok, S) {
   host.innerHTML = '';
   const dims = [];   // {label, val, cls, detail}
-  if (S.feasN) { const a = S.feasAcc; dims.push({ label: 'Growth feasibility', val: (100 * a).toFixed(0) + '%', cls: a >= 0.9 ? 'ok' : a >= 0.7 ? 'warn' : 'bad', detail: `${S.grow}/${S.feasN} should-grow conditions produce growth on their reported medium`, w: a }); }
+  if (S.feasN) { const a = S.feasAcc; dims.push({ label: 'Growth feasibility', val: (100 * a).toFixed(0) + '%', cls: a >= 0.9 ? 'ok' : a >= 0.7 ? 'warn' : 'bad', detail: `${S.grow}/${S.feasN} should-grow conditions produce growth on their reported medium`, w: a, n: S.feasN }); }
   // growth-YIELD agreement (constrained): the measured uptake bounds the model, so predicted µ = uptake × yield —
   // a real quantitative comparison, scored on a tighter ±30% band
   const yieldP = S.muPairs.filter(x => x.con), maxP = S.muPairs.filter(x => !x.con);
   const medOf = arr => { const r = arr.map(x => x.m > 0 ? x.p / x.m : null).filter(x => x != null && isFinite(x)).sort((a, b) => a - b); return r.length ? r[Math.floor(r.length / 2)] : null; };
   if (yieldP.length) {
     const within = yieldP.filter(x => x.m > 0 && x.p / x.m >= 0.7 && x.p / x.m <= 1.3).length; const frac = within / yieldP.length; const med = medOf(yieldP);
-    dims.push({ label: 'Growth-yield agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${yieldP.length} predicted µ within ±30% of measured when the model is constrained to the record's measured substrate uptake (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). This is the quantitative yield test — the model isn't free to over-predict.`, w: frac });
+    dims.push({ label: 'Growth-yield agreement', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${yieldP.length} predicted µ within ±30% of measured when the model is constrained to the record's measured substrate uptake (median pred/meas ${med ? med.toFixed(2) : 'n/a'}×). This is the quantitative yield test — the model isn't free to over-predict.`, w: frac, n: yieldP.length });
   }
   if (maxP.length) {
     const within = maxP.filter(x => x.m > 0 && x.p / x.m >= 0.5 && x.p / x.m <= 2).length; const frac = within / maxP.length; const med = medOf(maxP);
-    dims.push({ label: 'Max-growth µ (upper bound)', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${maxP.length} within 2× of measured (median ${med ? med.toFixed(2) : 'n/a'}×). No measured uptake, so FBA maximises growth and over-predicts by design — a loose check.`, w: frac });
+    dims.push({ label: 'Max-growth µ (upper bound)', val: (100 * frac).toFixed(0) + '%', cls: frac >= 0.7 ? 'ok' : frac >= 0.4 ? 'warn' : 'bad', detail: `${within}/${maxP.length} within 2× of measured (median ${med ? med.toFixed(2) : 'n/a'}×). No measured uptake, so FBA maximises growth and over-predicts by design — a loose check.`, w: frac, n: maxP.length });
   }
   // knockout-phenotype accuracy: does the model reproduce each mutant's grow/no-grow?
-  if (S.koTested) { const a = S.koMatch / S.koTested; dims.push({ label: 'Knockout phenotypes', val: (100 * a).toFixed(0) + '%', cls: a >= 0.8 ? 'ok' : a >= 0.6 ? 'warn' : 'bad', detail: `${S.koMatch}/${S.koTested} gene-deletion derivatives whose grow/no-grow the model reproduces (GPR knockout applied; genes present in the model).`, w: a }); }
+  if (S.koTested) { const a = S.koMatch / S.koTested; dims.push({ label: 'Knockout phenotypes', val: (100 * a).toFixed(0) + '%', cls: a >= 0.8 ? 'ok' : a >= 0.6 ? 'warn' : 'bad', detail: `${S.koMatch}/${S.koTested} gene-deletion derivatives whose grow/no-grow the model reproduces (GPR knockout applied; genes present in the model).`, w: a, n: S.koTested }); }
   if (S.spec && S.spec.tested) { const mcc = spectrumMCC(S.spec); const norm = (mcc + 1) / 2;
-    dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ` (${S.spec.tested}-substrate balanced sample)` : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm }); }
-  if (S.secTot) { const a = S.secRecall; dims.push({ label: 'Secretion recall', val: (100 * a).toFixed(0) + '%', cls: a >= 0.7 ? 'ok' : a >= 0.4 ? 'warn' : 'bad', detail: `${S.secHit}/${S.secTot} measured secretion products the model can produce under the reported condition`, w: a }); }
+    dims.push({ label: 'Substrate spectrum (MCC)', val: mcc.toFixed(2), cls: mcc >= 0.6 ? 'ok' : mcc >= 0.3 ? 'warn' : 'bad', detail: `${S.spec.TP + S.spec.TN}/${S.spec.tested} correct on grows-on/no-grow${S.spec.capped ? ` (${S.spec.tested}-substrate balanced sample)` : ''}; ${S.spec.FN} false-neg (gap-fill), ${S.spec.FP} false-pos (over-permissive)`, w: norm, n: S.spec.tested }); }
+  if (S.secTot) { const a = S.secRecall;
+    const rate = S.secRateN ? `; quantitatively, ${S.secRateHit}/${S.secRateN} of the biomass-specific secretion rates predicted within 2×` : '';
+    const lowNote = a < 0.3 ? ' <b>Note:</b> biomass-maximising FBA rarely secretes overflow products (acetate, ethanol…) — they appear at sub-maximal growth, so low recall here is expected, not necessarily a model defect.' : '';
+    dims.push({ label: 'Secretion recall', val: (100 * a).toFixed(0) + '%', cls: a >= 0.7 ? 'ok' : a >= 0.4 ? 'warn' : 'bad', detail: `${S.secHit}/${S.secTot} measured secretion products the model can produce under the reported condition${rate}.${lowNote}`, w: a, n: S.secTot }); }
   if (!dims.length) { host.appendChild(el('div', 'ac-empty', 'No validation dimension could be scored (no simulable medium and no spectrum).')); return; }
   const overall = dims.reduce((s, d) => s + d.w, 0) / dims.length;
   const grade = overall >= 0.85 ? ['A', 'ok'] : overall >= 0.7 ? ['B', 'ok'] : overall >= 0.55 ? ['C', 'warn'] : overall >= 0.4 ? ['D', 'warn'] : ['F', 'bad'];
@@ -1342,10 +1370,15 @@ function renderScorecard(host, sp, detTok, S) {
   card.appendChild(el('h3', '', `GEM validation scorecard — <i>${esc(sp)}</i>${detTok ? ' · ' + esc(detTok) : ''}`));
   const head = el('div', ''); head.style.cssText = 'display:flex;align-items:center;gap:16px;margin:8px 0 4px;flex-wrap:wrap';
   head.innerHTML = `<div style="font-size:44px;font-weight:800;line-height:1;color:${gcol}">${grade[0]}</div><div style="font-size:13px;color:var(--ink-2)">Composite <b>${(100 * overall).toFixed(0)}%</b> across ${dims.length} validation dimension${dims.length > 1 ? 's' : ''}, from <b>${S.sampled}</b>${S.withMed > S.sampled ? ' of ' + S.withMed : ''} growth condition${S.sampled > 1 ? 's' : ''}${S.strainCond ? ` (${S.strainCond} strain-specific)` : ''}${S.koTested ? `, ${S.koTested} knockout derivative${S.koTested > 1 ? 's' : ''}` : ''} + the substrate spectrum. Each dimension is unweighted; the letter reflects the mean.</div>`;
+  // overall confidence: a grade resting on few datapoints is provisional
+  const evidence = dims.reduce((s, d) => s + (d.n || 0), 0);
+  const conf = evidence >= 60 ? ['high', 'ok'] : evidence >= 25 ? ['moderate', 'warn'] : ['low', 'bad'];
+  head.innerHTML = head.innerHTML.replace('the letter reflects the mean.', `the letter reflects the mean. <b style="color:${{ ok: '#15803D', warn: '#B45309', bad: '#DC2626' }[conf[1]]}">Confidence: ${conf[0]}</b> (${evidence} datapoints).`);
   card.appendChild(head);
   dims.forEach(d => { const cls = { ok: '#15803D', warn: '#B45309', bad: '#DC2626' }[d.cls];
+    const thin = d.n != null && d.n < 5;
     const row = el('div', ''); row.style.cssText = 'display:grid;grid-template-columns:180px 70px 1fr;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line)';
-    row.innerHTML = `<div style="font-size:13px;font-weight:600">${esc(d.label)}</div><div style="font-size:16px;font-weight:700;color:${cls}">${d.val}</div><div style="font-size:12px;color:var(--ink-3)">${d.detail}</div>`;
+    row.innerHTML = `<div style="font-size:13px;font-weight:600">${esc(d.label)}${d.n != null ? ` <span style="color:var(--ink-3);font-weight:400;font-size:11px">n=${d.n}${thin ? ' ⚠' : ''}</span>` : ''}</div><div style="font-size:16px;font-weight:700;color:${cls}">${d.val}</div><div style="font-size:12px;color:var(--ink-3)">${d.detail}${thin ? ' <b>Small sample — provisional.</b>' : ''}</div>`;
     card.appendChild(row); });
   card.appendChild(el('div', 'ac-interp', `A single number hides detail — open each validation below for the per-condition table, confusion matrix, and the exact false-positive / false-negative substrate lists (the actionable curation targets). ${S.withMed > S.sampled ? `Only the first ${S.sampled} conditions with a simulable medium were scored for responsiveness; ` : ''}growth-feasibility counts a condition as passing if the model grows at all on the reported medium.`));
   host.appendChild(card);
