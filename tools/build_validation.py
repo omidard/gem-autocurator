@@ -114,7 +114,21 @@ if os.path.exists(SPIDX):
         if isinstance(r, dict) and (r.get("ngam") or r.get("yxs")):
             maint[r["s"]] = {"ngam": r.get("ngam"), "yxs": r.get("yxs")}
 
-json.dump({"species": species_list, "records": records, "tax2sp": tax2sp, "maint": maint}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
+# provenance/version stamp so the modeller knows how current the validation bundle is
+import datetime, subprocess
+def _git_rev(repo):
+    try:
+        return subprocess.check_output(["git", "-C", repo, "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+meta = {"built": datetime.date.today().isoformat(),
+        "n_records": len(records), "n_species": len(species_list),
+        "n_mu": sum(1 for r in records if r["mu"] is not None),
+        "growthdb_rev": _git_rev("/data/GrowthDB_work") or _git_rev("/data/GrowthDB"),
+        "media_rev": _git_rev("/data/media_curate")}
+
+json.dump({"meta": meta, "species": species_list, "records": records, "tax2sp": tax2sp, "maint": maint}, open(OUT + "/growthdb.json", "w"), separators=(",", ":"))
+print("bundle stamp:", meta)
 print("maintenance fits (NGAM/Yxs): %d species" % len(maint))
 
 # ---- substrate-utilisation SPECTRUM per species (for grows-on-X confusion-matrix validation) ----

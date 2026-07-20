@@ -765,7 +765,9 @@ function renderValidate() {
   s.appendChild(box);
   const results = el('div', ''); results.id = 'val-results'; s.appendChild(results);
   loadValidation().then(async () => {
-    box.querySelector('.sub').innerHTML += ` <b>${fmt(GDB.records.length)}</b> records / <b>${fmt(GDB.species.length)}</b> species loaded.`;
+    const mm = GDB.meta || {};
+    box.querySelector('.sub').innerHTML += ` <b>${fmt(GDB.records.length)}</b> records / <b>${fmt(GDB.species.length)}</b> species loaded.` +
+      (mm.built ? ` <span style="color:var(--ink-3);font-size:11.5px">· validation bundle built ${esc(mm.built)}${mm.growthdb_rev ? ' · GrowthDB @' + esc(mm.growthdb_rev) : ''}${mm.media_rev ? ' · Media @' + esc(mm.media_rev) : ''}</span>` : '');
     const q = $('val-q'), hits = $('val-hits');
     const showHits = () => {
       const m = matchSpecies(q.value, 8); hits.innerHTML = '';
