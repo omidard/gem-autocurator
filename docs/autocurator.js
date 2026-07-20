@@ -63,8 +63,9 @@ function parseCobraJson(j, filename) {
     id: r.id, name: r.name || r.id, s: r.metabolites || {}, lb: r.lower_bound, ub: r.upper_bound,
     gpr: r.gene_reaction_rule || '', anno: xrefFromAnno(r.annotation),
   }));
+  const geneList = (j.genes || []).map(g => ({ id: g.id, name: g.name || g.id }));
   return { id: j.id || filename, name: j.name || j.id || filename, filename, format: 'COBRA JSON',
-    mets, rxns, genes: (j.genes || []).length, raw: j };
+    mets, rxns, genes: geneList.length, geneList, raw: j };
 }
 function tagText(node, ns, local) {
   const els = node.getElementsByTagName('*');
@@ -102,8 +103,9 @@ function parseSBML(text, filename) {
       gpr: gprOf(r), anno: xrefFromCV(r) };
   });
   const modelEl = all('model')[0] || {};
+  const geneList = all('geneProduct').map(g => ({ id: attr(g, 'id') || g.getAttribute('id'), name: attr(g, 'label') || attr(g, 'name') || g.getAttribute('id') }));
   return { id: (modelEl.getAttribute && modelEl.getAttribute('id')) || filename, name: (modelEl.getAttribute && modelEl.getAttribute('name')) || filename,
-    filename, format: 'SBML', mets, rxns, genes: all('geneProduct').length, raw: text };
+    filename, format: 'SBML', mets, rxns, genes: geneList.length, geneList, raw: text };
 }
 function gprOf(r) {
   const g = r.getElementsByTagNameNS('*', 'geneProductRef');
@@ -832,6 +834,7 @@ function showRecords(sp, detTok, detStrainName) {
   const mb = el('button', 'ac-btn', '✎ Enter my own condition instead'); mb.style.marginTop = '10px'; mb.onclick = () => showNoData(detStrainName ? sp + ' ' + detStrainName : sp); head.appendChild(mb);
   results.appendChild(head);
   renderCoveragePanel(results, sp, detTok, detStrainName);        // per-strain validation-resource map
+  renderStrainSimPanel(results, sp);                              // genotype-aware wild-type + knockout simulation
   renderSpectrumPanel(results, sp, detTok);                       // grows-on-X confusion-matrix validation
   const wrap = el('div', ''); results.appendChild(wrap);
   const state = { q: '' }; const renderers = [];
@@ -905,7 +908,9 @@ function conditionFromRecord(idx) {
     const row = add(u.met, lb, 'exp', { r: u.r, u: u.u, fu: !!u.fu });
     if (row) { row.src = 'exp'; row.meas = { r: u.r, u: u.u, fu: !!u.fu }; if (!INORG_SET.has(u.met)) row.lb = usable ? u.r : -CARBON_UPTAKE; } });
   const mf = maintFor(rec.sp);
-  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, medType: rec.med.mt, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null };
+  const ko = (rec.ko && rec.ko.length) ? resolveKO(MODEL, rec.ko) : null;   // genotype-aware knockout
+  return { species: rec.strain ? rec.sp + ' · ' + rec.strain : rec.sp, mu: rec.mu, mu_ok: rec.mu_ok, mu_qc: rec.mu_qc, rows, sec: rec.sec.map(x => ({ met: x.met, r: x.r, u: x.u })), miss, medMiss, medHave: medTot - medMiss.length, cit: rec.cit, doi: rec.doi, medName: rec.med.name, medType: rec.med.mt, manual: false, ngam: mf ? mf.ngam : null, yxs: mf ? mf.yxs : null, ngamSrc: mf ? 'growthdb' : null,
+    parent: rec.parent, isWt: rec.wt, koGenes: rec.ko || null, dead: ko ? ko.dead : null, koMatched: ko ? ko.matched : [], koUnmatched: ko ? ko.unmatched : [] };
 }
 function maintFor(sp) { return (GDB.maint && (GDB.maint[sp] || GDB.maint[speciesNorm(sp)])) || null; }
 function blankCondition(species) {
@@ -1223,8 +1228,38 @@ async function solveCondition(cond) {
   const maintRxn = findMaintenance(MODEL);
   if (cond.ngam != null && cond.ngam > 0 && maintRxn) ov[maintRxn.id] = { lb: cond.ngam };
   if (!carbon) return { predMu: 0, feasible: false, noCarbon: true, res: null };
-  const res = await fba(MODEL, bio.id, ov);
+  const koOv = cond.dead && cond.dead.size ? koOverlay(MODEL, cond.dead).ov : null;   // genotype-aware knockout
+  const res = await fba(MODEL, bio.id, koOv ? Object.assign({}, ov, koOv) : ov);
   return { predMu: Math.max(0, res.obj), feasible: res.obj > 1e-6, res };
+}
+/* ---- genotype-aware knockout: map KO gene symbols to model genes, disable GPR-dead reactions ---- */
+function geneIndex(model) {
+  if (model._geneIdx) return model._geneIdx;
+  const idx = {};
+  (model.geneList || []).forEach(g => { [g.id, g.name].forEach(k => { if (!k) return; const kk = String(k).toLowerCase(); (idx[kk] = idx[kk] || []).push(g.id); }); });
+  model._geneIdx = idx; return idx;
+}
+// resolve KO gene symbols (e.g. ldhA) to model gene ids (by name or id, case-insensitive)
+function resolveKO(model, symbols) {
+  const idx = geneIndex(model); const dead = new Set(); const matched = [], unmatched = [];
+  (symbols || []).forEach(sym => { const ids = idx[String(sym).toLowerCase()]; if (ids && ids.length) { ids.forEach(i => dead.add(i)); matched.push(sym); } else unmatched.push(sym); });
+  return { dead, matched, unmatched };
+}
+// evaluate a GPR boolean ("b1 and (b2 or b3)") with the dead genes set to false
+function gprActive(gpr, dead) {
+  if (!gpr || !gpr.trim()) return true;               // no GPR -> reaction isn't gene-controlled
+  const toks = gpr.replace(/[()]/g, ' $& ').split(/\s+/).filter(Boolean);
+  let i = 0;
+  const orE = () => { let v = andE(); while (/^or$/i.test(toks[i] || '')) { i++; const r = andE(); v = v || r; } return v; };
+  const andE = () => { let v = atom(); while (/^and$/i.test(toks[i] || '')) { i++; const r = atom(); v = v && r; } return v; };
+  const atom = () => { if (toks[i] === '(') { i++; const v = orE(); if (toks[i] === ')') i++; return v; } const g = toks[i++]; return !dead.has(g); };
+  return orE();
+}
+// reactions whose GPR is fully knocked out by the dead genes -> constrain to zero flux
+function koOverlay(model, dead) {
+  const ov = {}; let n = 0;
+  if (dead && dead.size) model.rxns.forEach(r => { if (r.gpr && r.gpr.trim() && !gprActive(r.gpr, dead)) { ov[r.id] = { lb: 0, ub: 0 }; n++; } });
+  return { ov, n };
 }
 async function runScorecard(sp, detTok, host, o2override) {
   host.innerHTML = `<div class="ac-load" style="display:flex;gap:10px;align-items:center"><div class="ac-spin"></div><span>Scoring the GEM across all validation types…</span></div>`;
@@ -1283,6 +1318,85 @@ function renderScorecard(host, sp, detTok, S) {
     card.appendChild(row); });
   card.appendChild(el('div', 'ac-interp', `A single number hides detail — open each validation below for the per-condition table, confusion matrix, and the exact false-positive / false-negative substrate lists (the actionable curation targets). ${S.withMed > S.sampled ? `Only the first ${S.sampled} conditions with a simulable medium were scored for responsiveness; ` : ''}growth-feasibility counts a condition as passing if the model grows at all on the reported medium.`));
   host.appendChild(card);
+}
+/* ---------------- genotype-aware strain-family simulation ---------------- */
+// group a species' records by parent strain; each family = wild type + derivatives (KOs) sharing a background
+function strainFamilies(sp) {
+  const idxs = GDB.bySpecies[sp] || []; const fam = {};
+  idxs.forEach(i => { const r = GDB.records[i]; if (r.mu == null && !(r.up && r.up.length)) return;
+    const key = r.parent || r.strain || '(unnamed)';
+    (fam[key] = fam[key] || []).push(i); });
+  return fam;
+}
+function renderStrainSimPanel(host, sp) {
+  const fam = strainFamilies(sp);
+  // keep families with a KO derivative that has a usable medium OR ≥2 genotype variants — the ones worth simulating
+  const worth = Object.entries(fam).filter(([, idxs]) => {
+    const hasKO = idxs.some(i => { const r = GDB.records[i]; return r.ko && r.sim && r.med && (r.med.id || r.med.ex); });
+    return hasKO;
+  }).sort((a, b) => b[1].length - a[1].length);
+  if (!worth.length) return;
+  const card = el('div', 'ac-card'); card.style.cssText = 'margin-top:12px;border:2px solid #e6dff5';
+  card.appendChild(el('h3', '', 'Genotype-aware simulation <span class="note">— wild type + knockout derivatives</span>'));
+  card.appendChild(el('div', 'sub', `GrowthDB groups this organism's records under <b>${worth.length}</b> strain ${worth.length > 1 ? 'families' : 'family'} that include gene-deletion derivatives. For each, the suite simulates the wild-type model on its medium, then applies each derivative's knockout (via the model's GPR), loads that record's medium, and compares predicted vs measured growth — so one uploaded model validates against the whole mutant panel.`));
+  worth.slice(0, 12).forEach(([parent, idxs]) => {
+    const wt = idxs.filter(i => GDB.records[i].wt).length, ko = idxs.filter(i => GDB.records[i].ko && GDB.records[i].sim).length;
+    const row = el('div', ''); row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px 0;border-top:1px solid var(--line);flex-wrap:wrap';
+    const btn = el('button', 'ac-btn', '▶ Simulate family');
+    const out = el('div', ''); out.style.cssText = 'flex-basis:100%;margin-top:4px';
+    btn.onclick = () => { btn.disabled = true; btn.textContent = 'Simulating…'; runStrainFamily(sp, parent, idxs, out).then(() => { btn.disabled = false; btn.textContent = '↻ Re-run'; }); };
+    row.innerHTML = `<div style="font-size:13.5px;font-weight:600;min-width:150px">${esc(parent)}</div><div style="font-size:12px;color:var(--ink-3)">${idxs.length} records · ${wt} wild-type · ${ko} knockout derivative${ko > 1 ? 's' : ''}</div>`;
+    row.append(btn, out); card.appendChild(row);
+  });
+  host.appendChild(card);
+}
+async function runStrainFamily(sp, parent, idxs, host) {
+  const bio = findBiomass(MODEL);
+  host.innerHTML = `<div class="ac-load" style="display:flex;gap:8px;align-items:center;margin:6px 0"><div class="ac-spin"></div><span>Simulating wild type + knockouts…</span></div>`;
+  if (!bio) { host.innerHTML = '<div class="ac-empty">No biomass reaction — cannot simulate.</div>'; return; }
+  // order: wild type first, then knockouts
+  const ordered = idxs.slice().sort((a, b) => (GDB.records[b].wt ? 1 : 0) - (GDB.records[a].wt ? 1 : 0));
+  const rows = [];
+  for (const i of ordered) {
+    const r = GDB.records[i];
+    if (!r.med || !(r.med.id || r.med.ex)) continue;              // needs a simulable medium
+    if (r.ko && !r.sim) continue;                                  // non-KO genetic mods can't be reproduced
+    const cond = conditionFromRecord(i);
+    const sol = await solveCondition(cond);
+    const koN = cond.dead ? koOverlay(MODEL, cond.dead).n : 0;
+    rows.push({ r, cond, pred: sol ? +sol.predMu.toFixed(4) : null, feasible: sol && sol.feasible,
+      koN, matched: cond.koMatched || [], unmatched: cond.koUnmatched || [] });
+    host.querySelector('.ac-load') && (host.querySelector('.ac-load span').textContent = `Simulated ${rows.length}…`);
+    await new Promise(z => setTimeout(z, 0));
+  }
+  if (!rows.length) { host.innerHTML = '<div class="ac-empty" style="margin:6px 0">No records in this family have a simulable medium.</div>'; return; }
+  host.innerHTML = '';
+  const tbl = el('div', ''); tbl.style.cssText = 'overflow-x:auto';
+  const head = `<div style="display:grid;grid-template-columns:1.6fr 1.4fr 90px 90px 1fr;gap:8px;font-size:11px;color:var(--ink-3);font-weight:600;padding:4px 0;border-bottom:1px solid var(--line)"><div>GENOTYPE</div><div>MEDIUM</div><div>MEASURED µ</div><div>PRED µ</div><div>KNOCKOUT → VERDICT</div></div>`;
+  let body = '';
+  rows.forEach(x => {
+    const geno = x.r.wt ? '<b>wild type</b>' : (x.r.ko ? 'Δ' + x.r.ko.map(esc).join(' Δ') : esc(x.r.strain || '—'));
+    const meas = x.cond.mu == null ? '<span style="color:var(--ink-3)">—</span>' : x.cond.mu;
+    const pred = x.pred == null ? 'n/a' : (x.feasible ? x.pred : '<span style="color:#B45309">no growth</span>');
+    let verdict = '';
+    if (x.r.ko) {
+      if (!x.matched.length) verdict = `<span style="color:#B45309">genes not in model (${x.unmatched.map(esc).join(', ')}) — KO not applied</span>`;
+      else verdict = `${x.koN} rxn${x.koN !== 1 ? 's' : ''} disabled (${x.matched.map(esc).join(', ')}${x.unmatched.length ? '; unmatched ' + x.unmatched.map(esc).join(', ') : ''})`;
+    } else verdict = '<span style="color:var(--ink-3)">reference (no KO)</span>';
+    // agreement chip when both measured and predicted exist
+    let chip = '';
+    if (x.cond.mu != null && x.pred != null) {
+      const ok = x.feasible && x.cond.mu > 0 ? (x.pred / x.cond.mu >= 0.5 && x.pred / x.cond.mu <= 2) : (!x.feasible && x.cond.mu < 1e-4);
+      const grew = x.feasible, obsGrew = x.cond.mu > 1e-4;
+      chip = grew === obsGrew ? '<span style="color:#15803D">✓ match</span>' : '<span style="color:#DC2626">✗ mismatch</span>';
+    }
+    body += `<div style="display:grid;grid-template-columns:1.6fr 1.4fr 90px 90px 1fr;gap:8px;font-size:12.5px;padding:6px 0;border-bottom:1px solid var(--line);align-items:baseline"><div><code>${geno}</code></div><div style="color:var(--ink-2);font-size:11.5px">${esc((x.cond.medName || '—').slice(0, 34))}</div><div>${meas}</div><div>${pred} ${chip}</div><div style="font-size:11px;color:var(--ink-3)">${verdict}</div></div>`;
+  });
+  tbl.innerHTML = head + body; host.appendChild(tbl);
+  // family-level readout: does the model reproduce the knockout growth changes?
+  const koRows = rows.filter(x => x.r.ko && x.matched.length);
+  const applied = koRows.filter(x => x.koN > 0).length;
+  host.appendChild(el('div', 'ac-interp', `Simulated <b>${rows.length}</b> records of strain family <b>${esc(parent)}</b> on <b>one</b> uploaded model. ${koRows.length ? `<b>${applied}/${koRows.length}</b> knockout derivatives had their deleted gene(s) present in the model and were reproduced as GPR-driven reaction knockouts; each row shows whether the model's grow/no-grow call matches the experiment.` : 'No knockout derivative had its genes in this model.'} Rows where the KO gene isn't in the model are flagged — those need the gene added before the mutant can be validated.`));
 }
 function renderSpectrumPanel(host, sp, detTok) {
   const spec = spectrumFor(sp, detTok);

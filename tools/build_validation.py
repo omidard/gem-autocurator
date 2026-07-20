@@ -84,9 +84,18 @@ for r in gr:
     strain_raw = r.get("strain")
     # fall back to a strain designation embedded in the organism name (e.g. "... str. K-12 substr. MG1655")
     sstd = strain_std(strain_raw) or strain_std(r.get("organism"))
+    # parsed strain genotype (parent to group under + deletion genes for genotype-aware KO simulation)
+    spar = r.get("strain_parsed") or {}
+    ko_genes = []
+    for op in (spar.get("genotype") or []):
+        if op.get("op") == "del":
+            ko_genes.extend(op.get("genes") or [])
     rec = {
         "sp": sp, "org": r.get("organism"),
         "strain": strain_display(strain_raw), "sstd": sstd,
+        "parent": spar.get("parent"), "wt": bool(spar.get("is_wt")),
+        "ko": ko_genes or None, "sim": bool(spar.get("simulable")),
+        "gother": any(o.get("op") == "other" for o in (spar.get("genotype") or [])),
         "mu": round(float(mu), 4) if mu is not None else None,
         "mu_ok": r.get("mu_usable"), "mu_qc": r.get("mu_qc"),
         "dt": r.get("doubling_time_h"),
