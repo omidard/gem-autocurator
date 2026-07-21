@@ -1063,7 +1063,13 @@ function spectrumFor(sp, strainTok) {
   if (strainTok && s.s) for (const [st, exs] of Object.entries(s.s)) {
     if (strainMatch(strainStd(st), st, strainTok)) { strainN += exs.length; exs.forEach(e => { pos.add(e); neg.delete(e); }); }
   }
-  return { pos, neg, strainN, o2: s.o2 || null, np: s.np || {}, nn: s.nn || {} };
+  return { pos, neg, strainN, o2: s.o2 || null, np: s.np || {}, nn: s.nn || {}, base: s.base || null };
+}
+// the metabolites of the formulated Biolog/assimilation base medium (minerals; + vitamins for gram-positives),
+// falling back to the standard mineral set if the base isn't bundled
+function baseMets(spec) {
+  const bm = spec && spec.base && MEDIA && MEDIA[spec.base];
+  return bm ? bm.ex.map(e => metOfExId(e[0])) : INORGANIC.concat(['nh4', 'pi', 'so4']);
 }
 // resolve whether O2 should be open: an explicit override wins, else follow the organism's lifestyle
 // (obligate anaerobes tested O2-closed; aerobe/facultative/microaerophile/unknown tested O2-open)
@@ -1112,9 +1118,11 @@ async function computeSpectrum(sp, strainTok, o2override, cap, onProg, opts) {
     const nPos = Math.min(pos.length, cap - nNeg);
     items = pos.slice(0, nPos).concat(neg.slice(0, nNeg));
   }
-  // withhold the mineral the substrate is meant to supply, so the substrate must provide that element
+  // open the FORMULATED defined-minimal base (minerals; + B-vitamins for gram-positive/fastidious
+  // organisms, so vitamin auxotrophy isn't mis-scored as a carbon-utilisation failure). Withhold the
+  // mineral the substrate is meant to supply so the substrate must provide that element.
   const withhold = { nitrogen: 'nh4', sulfur: 'so4', phosphorus: 'pi' }[role];
-  const openMin = new Set(INORGANIC.concat(['nh4', 'pi', 'so4'])); if (withhold) openMin.delete(withhold);
+  const openMin = new Set(baseMets(spec)); if (withhold) openMin.delete(withhold);
   let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i];

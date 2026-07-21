@@ -172,15 +172,23 @@ if os.path.isdir(SPECIES_DIR):
                 st = r.get("strain")
                 if st:
                     by_strain.setdefault(st, set()).add(ex)
-        # phenotypes carry the substrate ROLE in `category` and the call in `phenotype` (positive/negative)
+        # phenotypes carry the substrate ROLE in `category` and the call in `phenotype`. ONLY growth-type
+        # assays (defined-minimal, substrate as sole C/N/S/P source) belong in the grows-on confusion
+        # matrix — acid-production (fermentation on a complex base) and enzyme assays (hydrolysis/reduction)
+        # are NOT growth-on-X and are handled by separate validations (see acid_phenos / enzyme_phenos below).
+        base_c = None
         for p in (d.get("phenotypes") or []):
             ex = p.get("exchange")
             if not ex:
+                continue
+            if (p.get("assay_type") or "growth") not in ("growth", "growth_uncertain"):
                 continue
             cat = p.get("category") or "carbon"
             is_pos = p.get("phenotype") == "positive"
             if cat == "carbon":
                 (pos if is_pos else neg).add(ex)
+                if base_c is None and p.get("base_media_id"):
+                    base_c = p["base_media_id"]           # this species' carbon-base (GN minimal vs GP +vitamins)
             elif cat in ("nitrogen", "sulfur", "phosphorus"):
                 (rpos if is_pos else rneg).setdefault(cat, set()).add(ex)
         neg -= pos                                    # positive evidence wins a conflict (carbon)
@@ -196,6 +204,8 @@ if os.path.isdir(SPECIES_DIR):
                 entry["np"] = {c: sorted(v) for c, v in rpos.items() if v}
             if rneg:
                 entry["nn"] = {c: sorted(v) for c, v in rneg.items() if v}
+            if base_c:
+                entry["base"] = base_c                    # formulated defined-minimal carbon base for this species
             spectrum[sp] = entry
 with open(OUT + "/spectrum.json", "w") as fh:
     json.dump(spectrum, fh, separators=(",", ":"))
@@ -204,9 +214,11 @@ n_neg = sum(len(v["n"]) for v in spectrum.values())
 print("spectrum: %d species | %d grows-on + %d no-grow exchanges | %d bytes"
       % (len(spectrum), n_pos, n_neg, os.path.getsize(OUT + "/spectrum.json")))
 
-# media exchange compositions for referenced media
+# media exchange compositions for referenced media (+ the formulated Biolog/assimilation base media,
+# so the substrate-spectrum sweep opens the EXACT base — minerals, and vitamins for gram-positives)
 media_ex = {}
 files = {os.path.basename(f)[:-5]: f for f in glob.glob(MEDIA_DIR + "/*.json")}
+referenced = set(referenced) | {"biolog_base_def_min_c", "biolog_base_def_min_c_vit", "biolog_base_def_min_n", "biolog_base_def_min_ps"}
 for mid in referenced:
     f = files.get(mid)
     if not f:
