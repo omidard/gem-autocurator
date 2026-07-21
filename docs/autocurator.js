@@ -11,7 +11,7 @@ let REF = null;        // {met, rxn, props}
 let MODEL = null;      // parsed model
 let RESULT = null;     // curation result {ids, discrep, structure, charge}
 const APPROVED = {};   // issueId -> true/false (undefined = pending)
-try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, exportJson, exportSBML, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor }) }); } catch (e) {}  // debug/headless hook
+try { Object.defineProperty(window, '__ac', { get: () => ({ MODEL, RESULT, REF, APPROVED, exportMAT, exportJson, exportSBML, applyApproved, GDB, MEDIA, SPECTRUM, conditionFromRecord, validationCoverage, spectrumFor, computeSpectrum, spectrumMCC, computeFermentation, fba, findBiomass, exIndexByMet, baseMets, INORGANIC }) }); } catch (e) {}  // debug/headless hook
 
 /* ---------------- reference maps ---------------- */
 async function fetchJsonGz(url) {   // GitHub Pages serves .gz raw (no Content-Encoding) -> decompress client-side
@@ -1159,11 +1159,51 @@ async function runSpectrumValidation(sp, strainTok, host, o2override) {
       if (rr) renderSpectrumResult(host, sp, { ...rr, strainTok, o2pref: spec.o2, refCarbonMet: refCarbon && refCarbon.met });
     }
   }
+  // fermentation / acid-production: does the model produce a fermentation acid from each acid-tested substrate?
+  if (SPECTRUM[sp] && SPECTRUM[sp].acid) {
+    const fr = await computeFermentation(sp, o2override, (i, n) => { prog.innerHTML = `Testing acid production <b>${i}/${n}</b>…`; });
+    if (fr && fr.tested) renderSpectrumResult(host, sp, { ...fr, role: 'ferment', strainTok, o2pref: spec.o2 });
+  }
   prog.remove();
+}
+// FERMENTATION (acid-production) validation: for a substrate the organism acidifies, can the model
+// produce a fermentation acid (acetate/lactate/formate/succinate/propionate/butyrate) from it? This
+// validates the CATABOLIC pathway for the substrate, independent of whether it supports growth.
+const FERM_ACIDS = ['ac', 'lac__L', 'lac__D', 'for', 'succ', 'ppa', 'but', 'pyr'];
+async function computeFermentation(sp, o2override, onProg) {
+  const s = SPECTRUM && SPECTRUM[sp]; if (!s || !s.acid) return null;
+  const bio = findBiomass(MODEL); if (!bio) return null;
+  const exByMet = exIndexByMet(MODEL);
+  const o2open = o2IsOpen(s.o2, o2override);
+  const bmets = baseMets({ base: s.base });
+  const acidRids = FERM_ACIDS.map(a => exByMet[a]).filter(Boolean);
+  if (!acidRids.length) return { tested: 0, noAcid: true };
+  const obs = new Map();
+  (s.acid.p || []).forEach(ex => obs.set(metOfExId(ex), 'pos'));
+  (s.acid.n || []).forEach(ex => { const b = metOfExId(ex); if (!obs.has(b)) obs.set(b, 'neg'); });
+  const items = []; obs.forEach((o, b) => { const rid = exByMet[b]; if (rid) items.push({ b, rid, obs: o }); });
+  let TP = 0, TN = 0, FP = 0, FN = 0; const fp = [], fn = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const ov = {}; MODEL.rxns.forEach(r => { if (isExchange(r)) ov[r.id] = { lb: 0, ub: 1000 }; });
+    bmets.forEach(b => { const rid = exByMet[b]; if (rid) ov[rid] = { lb: -1000, ub: 1000 }; });
+    if (o2open) { const o = exByMet['o2']; if (o) ov[o] = { lb: -1000, ub: 1000 }; }
+    ov[it.rid] = { lb: -10, ub: 1000 };                            // the substrate as carbon
+    // can the model make acid from it? maximise each acid exchange in turn; positive = the pathway exists
+    let makesAcid = false;
+    for (const arid of acidRids) { if (arid === it.rid) continue; const res = await fba(MODEL, arid, ov); if (res.obj > 1e-3) { makesAcid = true; break; } }
+    const o = it.obs === 'pos';
+    if (makesAcid && o) TP++; else if (!makesAcid && !o) TN++; else if (makesAcid && !o) { FP++; fp.push(it); } else { FN++; fn.push(it); }
+    if (onProg && (i % 8 === 0 || i === items.length - 1)) { onProg(i + 1, items.length); await new Promise(z => setTimeout(z, 0)); }
+  }
+  return { TP, TN, FP, FN, fp, fn, tested: items.length, notInModel: obs.size - items.length, o2open };
 }
 function renderSpectrumResult(host, sp, R) {
   const role = R.role || 'carbon';
-  if (role !== 'carbon') {                         // secondary N/S/P panel
+  if (role === 'ferment') {
+    if (!R.tested) return;
+    host.appendChild(el('div', '', `<h3 style="margin:14px 0 4px">Fermentation / acid production <span class="note">— can the model make a fermentation acid (acetate/lactate/formate/succinate…) from each substrate the organism acidifies? Validates the catabolic pathway, not growth.</span></h3>`));
+  } else if (role !== 'carbon') {                    // secondary N/S/P panel
     if (R.noRefCarbon) { host.appendChild(el('div', 'ac-interp', `<b>${role[0].toUpperCase() + role.slice(1)}-source spectrum:</b> skipped — the model doesn't grow on any known carbon source, so there's no background carbon to test ${role} utilisation against.`)); return; }
     if (!R.tested) return;
     host.appendChild(el('div', '', `<h3 style="margin:14px 0 4px">${role[0].toUpperCase() + role.slice(1)}-source utilisation <span class="note">— substrate as sole ${role.replace('phosphorus', 'P').replace('nitrogen', 'N').replace('sulfur', 'S')} source, with ${R.refCarbonMet ? '<code>' + esc(R.refCarbonMet) + '</code>' : 'a background carbon'} as carbon</span></h3>`));
@@ -1178,9 +1218,10 @@ function renderSpectrumResult(host, sp, R) {
   // 2x2 confusion matrix
   const cm = el('div', ''); cm.style.cssText = 'display:grid;grid-template-columns:auto 1fr 1fr;gap:2px;max-width:420px;margin:6px 0 12px;font-size:12.5px';
   const cell = (t, bg, cl) => `<div style="padding:8px 10px;background:${bg};color:${cl || 'var(--ink)'};border-radius:6px;text-align:center">${t}</div>`;
-  cm.innerHTML = cell('', 'transparent') + cell('<b>obs: grows</b>', 'var(--surface-2)') + cell('<b>obs: no-grow</b>', 'var(--surface-2)') +
-    cell('<b>model: grows</b>', 'var(--surface-2)') + cell(`<b>${R.TP}</b><br>true +`, '#dcfce7', '#15803D') + cell(`<b>${R.FP}</b><br>false +`, '#fef3c7', '#B45309') +
-    cell('<b>model: no-grow</b>', 'var(--surface-2)') + cell(`<b>${R.FN}</b><br>false −`, '#fee2e2', '#DC2626') + cell(`<b>${R.TN}</b><br>true −`, '#dcfce7', '#15803D');
+  const verb = role === 'ferment' ? 'acid+' : 'grows', neg = role === 'ferment' ? 'acid−' : 'no-grow';
+  cm.innerHTML = cell('', 'transparent') + cell(`<b>obs: ${verb}</b>`, 'var(--surface-2)') + cell(`<b>obs: ${neg}</b>`, 'var(--surface-2)') +
+    cell(`<b>model: ${verb}</b>`, 'var(--surface-2)') + cell(`<b>${R.TP}</b><br>true +`, '#dcfce7', '#15803D') + cell(`<b>${R.FP}</b><br>false +`, '#fef3c7', '#B45309') +
+    cell(`<b>model: ${neg}</b>`, 'var(--surface-2)') + cell(`<b>${R.FN}</b><br>false −`, '#fee2e2', '#DC2626') + cell(`<b>${R.TN}</b><br>true −`, '#dcfce7', '#15803D');
   host.appendChild(cm);
   const o2txt = R.o2open ? 'O₂ open' : 'O₂ closed';
   const o2why = R.o2overridden ? ' (you set this)' : R.o2pref ? ` (auto — GrowthDB lists this organism as <b>${esc(R.o2pref)}</b>)` : ' (default; O₂ preference unknown)';

@@ -177,20 +177,26 @@ if os.path.isdir(SPECIES_DIR):
         # matrix — acid-production (fermentation on a complex base) and enzyme assays (hydrolysis/reduction)
         # are NOT growth-on-X and are handled by separate validations (see acid_phenos / enzyme_phenos below).
         base_c = None
+        acid_pos, acid_neg = set(), set()               # fermentation / acid-production from the substrate (separate validation)
         for p in (d.get("phenotypes") or []):
             ex = p.get("exchange")
             if not ex:
                 continue
-            if (p.get("assay_type") or "growth") not in ("growth", "growth_uncertain"):
-                continue
-            cat = p.get("category") or "carbon"
+            at = p.get("assay_type") or "growth"
             is_pos = p.get("phenotype") == "positive"
+            if at == "acid_production":
+                (acid_pos if is_pos else acid_neg).add(ex)
+                continue
+            if at not in ("growth", "growth_uncertain"):
+                continue                                  # enzyme assays handled elsewhere
+            cat = p.get("category") or "carbon"
             if cat == "carbon":
                 (pos if is_pos else neg).add(ex)
                 if base_c is None and p.get("base_media_id"):
                     base_c = p["base_media_id"]           # this species' carbon-base (GN minimal vs GP +vitamins)
             elif cat in ("nitrogen", "sulfur", "phosphorus"):
                 (rpos if is_pos else rneg).setdefault(cat, set()).add(ex)
+        acid_neg -= acid_pos
         neg -= pos                                    # positive evidence wins a conflict (carbon)
         for cat in list(rneg):
             rneg[cat] -= rpos.get(cat, set())
@@ -206,6 +212,8 @@ if os.path.isdir(SPECIES_DIR):
                 entry["nn"] = {c: sorted(v) for c, v in rneg.items() if v}
             if base_c:
                 entry["base"] = base_c                    # formulated defined-minimal carbon base for this species
+            if acid_pos or acid_neg:
+                entry["acid"] = {"p": sorted(acid_pos), "n": sorted(acid_neg)}   # ferments-X (acid) — catabolic-pathway validation
             spectrum[sp] = entry
 with open(OUT + "/spectrum.json", "w") as fh:
     json.dump(spectrum, fh, separators=(",", ":"))
